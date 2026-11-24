@@ -1,6 +1,6 @@
 # DashboardDevolucao
 
-Aplicação Streamlit independente para o painel **Devolução - TCv2**, com navegação e componentes próprios do Streamlit. A fonte local é `data.xlsx`, na aba `Export`.
+Aplicação Streamlit independente para o painel **Devolução - TCv2**, com navegação e componentes próprios do Streamlit. A base é carregada pelo campo de importação do app.
 
 ## Executar no Linux
 
@@ -12,7 +12,7 @@ python3 -m pip install -r requirements.txt
 streamlit run app.py
 ```
 
-O Streamlit abre o painel no navegador. Mantenha `data.xlsx` junto de `app.py`. A navegação lateral contém BACKLOG, ENTRADA, CONTROLE CLIENTES, CONTROLE LOJAS, FAIXA DE VALOR e Lista CTE. Os filtros usam os valores presentes na base. Ao substituir a planilha, atualize a página do app para recarregar os dados.
+O Streamlit abre o painel no navegador. Importe um `.xlsx` pelo campo **Importar base** na barra lateral; o painel fica disponível após o upload e o arquivo enviado permanece ativo na sessão atual. Não há uma base local padrão no projeto. A navegação lateral contém BACKLOG, ENTRADA, CONTROLE CLIENTES, CONTROLE LOJAS, FAIXA DE VALOR e Lista CTE. Os filtros usam os valores presentes na base.
 
 ## Conteúdo
 
@@ -22,4 +22,4 @@ O Streamlit abre o painel no navegador. Mantenha `data.xlsx` junto de `app.py`. 
 - Identidade Jadlog em uma paleta mais leve, com realces vermelhos.
 - CTEs, pedidos e manifestos são carregados como texto para preservar os identificadores.
 
-O `data.xlsx` do app contém `DATA_ATUAL` e `CIDADE_ORIGEM` recuperadas do modelo PBIX e associadas à base completa pela CTE; esses campos não existem na exportação original. As matrizes de aging reproduzem o cálculo do PBIX (`DATEDIFF(DATA_ATUAL, TODAY())`) com referência em 08/09/2026. As tabelas `AGING - CUSTODIA` e `AGING ENTRADA - LOJAS E PA'S` usam os filtros de status, cidade, tipo e manifesto dos respectivos visuais. O total combinado de TRAVADO e ENCERRADO conta CTEs únicas, sem duplicar os registros que aparecem nos dois grupos. `DATA_EVENTO` continua vindo de `DT_ENTRADA_REVERSAS`. Se a planilha for substituída por uma exportação sem os campos recuperados, o app usa `DT_ENTRADA_REVERSAS` e `STATUS_TRATATIVA` como aproximações. Como a exportação não traz `FINALIZADO?`, o app considera `ENCERRADO` e `BAIXADO` como finalizados.
+O carregador também reconhece as colunas da nova exportação, como `DATA_SOLICITACAO`, `OCORRENCIA`, `CLIENTE` e `DATA_ULTIMA_DATA`, e remove linhas de total e observações do Power BI. Quando a fonte não traz `TIPO`, `STATUS_TRATATIVA` ou `CIDADE_ORIGEM`, o app mantém os campos sem inventar classificações; os recortes que dependem dessas dimensões aparecem como indisponíveis. As matrizes de aging usam a data atual como referência para o cálculo `DATEDIFF(DATA_ATUAL, TODAY())`.

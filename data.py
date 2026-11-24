@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from io import BytesIO
 from pathlib import Path
 
 import numpy as np
@@ -13,7 +14,7 @@ PBIX_ENTRY_AGE_BUCKETS = [
     "D+0", "D+1", "D+2", "D+3", "D+4", "D+5",
     "D+6-10", "D+11-15", "D+16-30", "D+30+",
 ]
-PBIX_ENTRY_AGE_AS_OF = pd.Timestamp("2026-09-08")
+PBIX_ENTRY_AGE_AS_OF: pd.Timestamp | None = None
 VALUE_BANDS = ["<300", "300~500", "500~700", "700~1000", "1000~2000", "2000~5000", "5000~10000", ">10000"]
 
 SOURCE_COLUMNS = [
@@ -39,10 +40,16 @@ def _identifier_text(series: pd.Series) -> pd.Series:
 
 
 def _excel_date(series: pd.Series) -> pd.Series:
-    serial = pd.to_numeric(series, errors="coerce")
-    excel_dates = pd.to_datetime(serial, unit="D", origin="1899-12-30", errors="coerce")
     text_dates = pd.to_datetime(series, dayfirst=True, errors="coerce")
-    return excel_dates.where(serial.notna(), text_dates)
+    text_values = series.astype("string").str.strip()
+    is_serial = text_values.str.fullmatch(r"\d+(?:\.\d+)?", na=False)
+    if not is_serial.any():
+        return text_dates
+    serial = pd.to_numeric(series.where(is_serial), errors="coerce")
+    excel_dates = pd.to_datetime(
+        serial, unit="D", origin="1899-12-30", errors="coerce"
+    )
+    return text_dates.where(~is_serial, excel_dates)
 
 
 def _age_bucket(days: pd.Series) -> pd.Series:
@@ -60,7 +67,7 @@ def _age_bucket(days: pd.Series) -> pd.Series:
 def powerbi_aging_bucket(
     data_actual: pd.Series, *, as_of: pd.Timestamp | None = None
 ) -> pd.Series:
-    """Apply the PBIX AgingEntrada DAX: DATEDIFF(DATA_ATUAL, TODAY(), DAY)."""
+    """Apply the PBIX aging rule: DATEDIFF(source_date, TODAY(), DAY)."""
     reference_date = (
         pd.Timestamp.today().normalize()
         if as_of is None
@@ -86,29 +93,85 @@ def powerbi_aging_bucket(
     )
 
 
-def load_source_data(path: str | Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Read the Excel export and return the full base plus its client/store slices."""
-    source_path = Path(path)
-    if not source_path.is_file():
-        raise FileNotFoundError(f"Base de dados não encontrada: {source_path}")
+def load_source_data(
+    source: str | Path | bytes | bytearray | BytesIO,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Load either supported Jadlog workbook and normalize it for the dashboard."""
+    if isinstance(source, (bytes, bytearray)):
+        workbook: str | Path | BytesIO = BytesIO(source)
+    elif hasattr(source, "read"):
+        workbook = source  # type: ignore[assignment]
+    else:
+        source_path = Path(source)
+        if not source_path.is_file():
+            raise FileNotFoundError(f"Base de dados não encontrada: {source_path}")
+        workbook = source_path
 
-    frame = pd.read_excel(source_path, sheet_name="Export", engine="openpyxl")
-    missing = [column for column in SOURCE_COLUMNS if column not in frame.columns]
+    try:
+        excel_file = pd.ExcelFile(workbook, engine="openpyxl")
+        sheet_name = "Export" if "Export" in excel_file.sheet_names else excel_file.sheet_names[0]
+        frame = pd.read_excel(excel_file, sheet_name=sheet_name)
+    except (ValueError, IndexError) as exc:
+        raise ValueError("O arquivo não contém uma planilha com dados para importar.") from exc
+
+    frame.columns = [str(column).strip() for column in frame.columns]
+    # Map the BI export names to the dashboard's canonical dimensions.
+    # Prefer CLIENTE(S) over the older SHIPPER field when both are present.
+    client_column = next(
+        (name for name in ("CLIENTE", "CLIENTES") if name in frame.columns),
+        None,
+    )
+    if client_column is not None:
+        frame["SHIPPER"] = frame[client_column]
+    aliases = {
+        "SOLICITACAO": ("DATA_SOLICITACAO", "DATA_SOLICITAÇÃO"),
+        "DESCRICAO_ATUAL": ("OCORRENCIA",),
+        "SHIPPER": ("CLIENTE", "CLIENTES"),
+        "EMISSOR": ("LOJAS E PA'S", "LOJAS E PAS"),
+        "DT_ENTRADA_REVERSAS": ("DATA_ULTIMA_DATA", "DATA_EVENTO"),
+    }
+    for target, alternatives in aliases.items():
+        if target not in frame.columns:
+            alternate = next((name for name in alternatives if name in frame.columns), None)
+            if alternate is not None:
+                frame[target] = frame[alternate]
+
+    missing = [column for column in ("CTE", "STATUS_ATUAL") if column not in frame.columns]
     if missing:
-        raise ValueError("Colunas ausentes na aba Export: " + ", ".join(missing))
+        raise ValueError("Colunas obrigatórias ausentes: " + ", ".join(missing))
 
-    # These model fields are not present in the original export. The app
-    # workbook adds the PBIX values, matched one-to-one by CTE.
-    model_data_actual = (
-        pd.to_datetime(frame["DATA_ATUAL"], dayfirst=True, errors="coerce")
-        if "DATA_ATUAL" in frame.columns
-        else None
+    # Exports from Power BI may contain a totals row, a blank row, and a filter
+    # description after the detail records. Keep only rows with a CTE value.
+    cte_values = _identifier_text(frame["CTE"])
+    cte_labels = cte_values.str.strip().str.casefold()
+    keep_rows = (
+        cte_values.notna()
+        & cte_values.str.strip().ne("")
+        & cte_labels.ne("total")
+        & ~cte_labels.str.startswith("filtros aplicados", na=False)
     )
-    model_city_origin = (
-        frame["CIDADE_ORIGEM"].astype("string").str.strip().replace("", pd.NA)
-        if "CIDADE_ORIGEM" in frame.columns
-        else None
+    frame = frame.loc[keep_rows].copy()
+    frame["CTE"] = cte_values.loc[keep_rows]
+    if frame.empty:
+        raise ValueError("Nenhum registro com CTE foi encontrado no arquivo.")
+
+    actual_column = next(
+        (name for name in ("DATA_ATUAL", "DATA_ULTIMA_DATA", "DT_ENTRADA_REVERSAS") if name in frame),
+        None,
     )
+    model_data_actual = _excel_date(frame[actual_column]) if actual_column else None
+    model_city_origin = frame["CIDADE_ORIGEM"] if "CIDADE_ORIGEM" in frame else None
+    model_treatment = frame["STATUS_TRATATIVA"] if "STATUS_TRATATIVA" in frame else None
+    source_type = frame["TIPO"] if "TIPO" in frame else None
+    finalized_source = (
+        frame["FINALIZADO?"]
+        if "FINALIZADO?" in frame
+        else frame["FINALIZADO"] if "FINALIZADO" in frame else None
+    )
+
+    for column in SOURCE_COLUMNS:
+        if column not in frame.columns:
+            frame[column] = pd.NA
     frame = frame.loc[:, SOURCE_COLUMNS].copy()
     for column in [
         "STATUS_ATUAL", "DESCRICAO_ATUAL", "STATUS_TRATATIVA", "EMISSOR",
@@ -116,36 +179,60 @@ def load_source_data(path: str | Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.D
     ]:
         frame[column] = frame[column].astype("string").str.strip().replace("", pd.NA)
 
-    for column in ["CTE", "PEDIDO", "MANIFESTO"]:
+    for column in ["PEDIDO", "MANIFESTO"]:
         frame[column] = _identifier_text(frame[column])
 
     frame["SOLICITACAO"] = _excel_date(frame["SOLICITACAO"])
     frame["DT_EMISSAO"] = _excel_date(frame["DT_EMISSAO"])
-    frame["DT_ENTRADA_REVERSAS"] = pd.to_datetime(
-        frame["DT_ENTRADA_REVERSAS"], dayfirst=True, errors="coerce"
-    )
+    frame["DT_ENTRADA_REVERSAS"] = _excel_date(frame["DT_ENTRADA_REVERSAS"])
     frame["VALOR_NF"] = pd.to_numeric(frame["VALOR_NF"], errors="coerce")
 
-    # Retain PBIX model fields when present; otherwise use the closest fields
-    # available in the source export.
+    # Retain PBIX fields where the export has them. Newer exports call the
+    # event date DATA_ULTIMA_DATA and the client/occurrence fields CLIENTE and
+    # OCORRENCIA, so the aliases above preserve those values.
     frame["DATA_ATUAL"] = (
         model_data_actual
         if model_data_actual is not None
         else frame["DT_ENTRADA_REVERSAS"]
     )
-    frame["DATA_EVENTO"] = frame["DT_ENTRADA_REVERSAS"]
+    frame["DATA_EVENTO"] = frame["DT_ENTRADA_REVERSAS"].where(
+        frame["DT_ENTRADA_REVERSAS"].notna(), frame["DATA_ATUAL"]
+    )
     frame["CIDADE_ORIGEM"] = (
-        model_city_origin
+        model_city_origin.astype("string").str.strip().replace("", pd.NA)
         if model_city_origin is not None
-        else frame["STATUS_TRATATIVA"]
+        else pd.Series(pd.NA, index=frame.index, dtype="string")
+    )
+    frame["STATUS_TRATATIVA"] = (
+        model_treatment.astype("string").str.strip().replace("", pd.NA)
+        if model_treatment is not None
+        else pd.Series(pd.NA, index=frame.index, dtype="string")
+    )
+    frame["TIPO"] = (
+        source_type.astype("string").str.strip().replace("", pd.NA).fillna("Não classificado")
+        if source_type is not None
+        else pd.Series("Não classificado", index=frame.index, dtype="string")
     )
 
-    # The export has no explicit completion flag; terminal treatment statuses
-    # are treated as finalized, while all other treatment statuses stay open.
+    # Normalize both the old boolean-like completion field and the newer
+    # FINALIZADO value into the same labels used by the dashboard.
     treatment = frame["STATUS_TRATATIVA"].str.upper()
-    frame["FINALIZADO?"] = np.where(
-        treatment.isin(["ENCERRADO", "BAIXADO"]), "FINALIZADO", "EM ABERTO"
-    )
+    terminal_by_treatment = treatment.isin(["ENCERRADO", "BAIXADO"])
+    if finalized_source is None:
+        frame["FINALIZADO?"] = np.where(terminal_by_treatment, "FINALIZADO", "EM ABERTO")
+    else:
+        finalized_values = finalized_source.astype("string").str.strip().str.upper()
+        finalized_yes = finalized_values.isin(
+            ["SIM", "S", "YES", "TRUE", "1", "FINALIZADO", "ENCERRADO", "BAIXADO"]
+        )
+        finalized_no = finalized_values.isin(
+            ["NAO", "NÃO", "N", "NO", "FALSE", "0", "EM ABERTO", "ABERTO"]
+        )
+        frame["FINALIZADO?"] = np.select(
+            [finalized_yes, finalized_no, terminal_by_treatment],
+            ["FINALIZADO", "EM ABERTO", "FINALIZADO"],
+            default="EM ABERTO",
+        )
 
     # Aging is calculated from dates present in the export, using the elapsed
     # time between the source milestones rather than generated demo values.
