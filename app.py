@@ -124,6 +124,8 @@ EMISSOR_ALLOWLIST = [
     'LJ SAO PAULO 18',
     'LJ TABOAO DA SERRA 01',
     'PA SAO PAULO 07',
+    'PA SAO PAULO 02',
+    'PA SAO PAULO 05',
     'PA BARUERI 09',
     'LJ EMBU DAS ARTES 01',
     'LJ SAO PAULO 13',
@@ -259,6 +261,7 @@ with st.sidebar:
     uploaded_file = st.file_uploader(
         "Arquivo Excel (.xlsx ou .xlsm)",
         type=["xlsx", "xlsm"],
+        help="Importe uma base Excel para abrir o painel. O arquivo fica ativo nesta sessão.",
         key="dashboard_source_upload_v2",
     )
 
@@ -321,6 +324,9 @@ def normalize_dimension_name(value: object) -> str:
 
 CLIENT_ALLOWLIST_KEYS = {normalize_dimension_name(name) for name in CLIENT_ALLOWLIST}
 EMISSOR_ALLOWLIST_KEYS = {normalize_dimension_name(name) for name in EMISSOR_ALLOWLIST}
+CLASSIFICATION_RULES_FINGERPRINT = hashlib.sha256(
+    "\x1f".join(CLIENT_ALLOWLIST + EMISSOR_ALLOWLIST).encode("utf-8")
+).hexdigest()
 
 
 def allowed_client_mask(frame: pd.DataFrame) -> pd.Series:
@@ -337,12 +343,12 @@ def allowed_emitter_mask(frame: pd.DataFrame) -> pd.Series:
 
 @st.cache_data(show_spinner=False, max_entries=8)
 def prepare_dashboard_frames(
-    source_fingerprint: str,
+    classification_fingerprint: str,
     assignment_pairs: tuple[tuple[str, str], ...],
     _raw_base: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Cache allowlist classification and labels for this source and rule set."""
-    del source_fingerprint
+    del classification_fingerprint
     base = _raw_base.copy()
     client_names = base["SHIPPER"].map(normalize_dimension_name)
     emitter_names = base["EMISSOR"].map(normalize_dimension_name)
@@ -379,10 +385,12 @@ def prepare_dashboard_frames(
 _conflict_pair_assignments = st.session_state.get("backlog_conflict_pair_assignments_v2", {})
 _assignment_pairs = tuple(sorted(_conflict_pair_assignments.items()))
 BASE, CONTROL_CLIENTS, CONTROL_STORES, CLASSIFIED_BASE = prepare_dashboard_frames(
-    source_fingerprint, _assignment_pairs, _RAW_BASE
+    f"{source_fingerprint}:{CLASSIFICATION_RULES_FINGERPRINT}",
+    _assignment_pairs,
+    _RAW_BASE,
 )
 XLSX_CACHE_EPOCH = hashlib.sha256(
-    f"{source_fingerprint}|{pd.Timestamp.today().date()}|{_assignment_pairs}".encode()
+    f"{source_fingerprint}|{CLASSIFICATION_RULES_FINGERPRINT}|{pd.Timestamp.today().date()}|{_assignment_pairs}".encode()
 ).hexdigest()
 
 
