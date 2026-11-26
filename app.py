@@ -259,7 +259,6 @@ with st.sidebar:
     uploaded_file = st.file_uploader(
         "Arquivo Excel (.xlsx ou .xlsm)",
         type=["xlsx", "xlsm"],
-        help="Importe uma base Excel para abrir o painel. O arquivo fica ativo nesta sessão.",
         key="dashboard_source_upload_v2",
     )
 
@@ -1438,7 +1437,14 @@ def aging_totals(df: pd.DataFrame, label: str, bucket_field: str) -> pd.DataFram
     return pd.DataFrame([row])
 
 
-def footer_detail(df: pd.DataFrame) -> None:
+def footer_detail(
+    df: pd.DataFrame,
+    *,
+    title: str = "DETALHES DOS CTEs",
+    height: int = 280,
+    export_name: str = "detalhes_ctes.xlsx",
+    key_suffix: str = "detail_cte",
+) -> None:
     """Show original imported detail columns with dashboard classifications."""
     chosen = detail_export_frame(df)
     detail_column_config: dict[str, object] = {
@@ -1460,7 +1466,7 @@ def footer_detail(df: pd.DataFrame) -> None:
     with st.container(border=True):
         title_col, actions_col = st.columns([1, .24], gap="small", vertical_alignment="center")
         with title_col:
-            st.markdown('<div class="panel-title">DETALHES DOS CTEs</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="panel-title">{esc(title)}</div>', unsafe_allow_html=True)
         with actions_col:
             buttons_col, _right_padding = st.columns([1, .08], gap=None)
             with buttons_col:
@@ -1473,21 +1479,21 @@ def footer_detail(df: pd.DataFrame) -> None:
                                 chosen, stable_source_rows=True
                             ),
                         ),
-                        file_name="detalhes_ctes.xlsx",
+                        file_name=export_name,
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key="export_detail_cte",
+                        key=f"export_{key_suffix}",
                         help="Exportar tabela em XLSX",
                         on_click="ignore",
                     )
-                    focus_clicked = st.button("⛶", key="focus_detail_cte", help="Abrir tabela geral em modo foco")
+                    focus_clicked = st.button("⛶", key=f"focus_{key_suffix}", help="Abrir tabela geral em modo foco")
         if focus_clicked:
-            show_table_focus("DETALHES DAS CTEs", chosen, native=True)
+            show_table_focus(title, chosen, native=True)
 
         st.dataframe(
             chosen,
             use_container_width=True,
             hide_index=True,
-            height=280,
+            height=height,
             column_config=detail_column_config,
         )
         st.caption(f"Total · {number_br(chosen['CTE'].notna().sum())}")
@@ -1618,18 +1624,12 @@ def backlog_page() -> None:
         with rua_right:
             rua_status_summary = summary_table(rua_rows, STATUS_DIMENSION, limit=None, options=STATUS_DIMENSION_NAMES)
             table_panel("STATUS", rua_status_summary, height=224, dark_header=True, numeric_columns=("QTDE",), total_note=number_br(len(rua_rows)), key_suffix="rua", cell_export_context=(rua_rows, STATUS_DIMENSION, None))
-        rua_columns = [
-            column for column in ["CTE", "PEDIDO", "SHIPPER", "EMISSOR", "STATUS_ATUAL", "SOLICITACAO", "VALOR_NF"]
-            if column in rua_rows
-        ]
-        rua_view = rua_rows[rua_columns].rename(columns={"SHIPPER": "CLIENTES", "EMISSOR": "LOJAS E PA'S"})
-        table_panel(
-            "PEDIDOS EM RUA",
-            rua_view,
+        footer_detail(
+            rua_rows,
+            title="PEDIDOS EM RUA",
             height=280,
-            key_suffix="rua_pedidos",
             export_name="pedidos_rua.xlsx",
-            export_frame=rua_rows,
+            key_suffix="rua_pedidos",
         )
 
     dates = pd.to_datetime(df["DATA_ATUAL"], errors="coerce")
