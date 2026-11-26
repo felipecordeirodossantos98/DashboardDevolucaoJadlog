@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    html, body { width: 100%; height: 100%; margin: 0; padding: 0; overflow: hidden; }
+    #table-root { width: 100%; height: 100%; }
+  </style>
+</head>
+<body>
+  <div id="table-root"></div>
+  <script>
+    const root = document.getElementById("table-root");
+    let lastDownloadToken = null;
+
+    function send(type, value) {
+      window.parent.postMessage({ isStreamlitMessage: true, type, ...value }, "*");
+    }
+
+    function triggerDownload(download) {
+      if (!download || !download.token || download.token === lastDownloadToken) return;
+      lastDownloadToken = download.token;
+      const raw = atob(download.base64 || "");
+      const bytes = new Uint8Array(raw.length);
+      for (let index = 0; index < raw.length; index += 1) {
+        bytes[index] = raw.charCodeAt(index);
+      }
+      const blob = new Blob([bytes], {
+        type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      });
+      const url = URL.createObjectURL(blob);
+      const downloadLink = document.createElement("a");
+      downloadLink.href = url;
+      downloadLink.download = download.filename || "export.xlsx";
+      document.body.appendChild(downloadLink);
+      downloadLink.click();
+      downloadLink.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 60000);
+      send("streamlit:setComponentValue", {
+        value: { type: "downloaded", token: download.token },
+      });
+    }
+
+    window.addEventListener("message", (event) => {
+      const message = event.data;
+      if (!message || message.type !== "streamlit:render") return;
+      const args = message.args || {};
+      root.innerHTML = args.table_html || "";
+      const height = Number(args.height) || 220;
+      document.documentElement.style.height = `${height}px`;
+      document.body.style.height = `${height}px`;
+      send("streamlit:setFrameHeight", { height });
+      triggerDownload(args.download);
+    });
+
+    document.addEventListener("click", (event) => {
+      const link = event.target.closest("a[data-cell-id]");
+      if (!link) return;
+      event.preventDefault();
+      event.stopPropagation();
+      send("streamlit:setComponentValue", {
+        value: { type: "export", cell_id: link.dataset.cellId },
+      });
+    });
+
+    send("streamlit:componentReady", { apiVersion: 1 });
+  </script>
+</body>
+</html>

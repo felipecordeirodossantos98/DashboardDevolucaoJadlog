@@ -20,7 +20,7 @@ VALUE_BANDS = ["<300", "300~500", "500~700", "700~1000", "1000~2000", "2000~5000
 SOURCE_COLUMNS = [
     "CTE", "PEDIDO", "STATUS_ATUAL", "SOLICITACAO", "DESCRICAO_ATUAL",
     "STATUS_TRATATIVA", "EMISSOR", "SOLICITANTE", "PROXIMA_UNIDADE",
-    "SHIPPER", "VALOR_NF", "TIPO", "DT_EMISSAO", "MANIFESTO",
+    "SHIPPER", "VALOR_NF", "TIPO", "DT_EMISSAO", "VENCIMENTO", "MANIFESTO",
     "DT_ENTRADA_REVERSAS",
 ]
 
@@ -115,6 +115,7 @@ def load_source_data(
         raise ValueError("O arquivo não contém uma planilha com dados para importar.") from exc
 
     frame.columns = [str(column).strip() for column in frame.columns]
+    original_columns = list(frame.columns)
     # Map the BI export names to the dashboard's canonical dimensions.
     # Prefer CLIENTE(S) over the older SHIPPER field when both are present.
     client_column = next(
@@ -129,6 +130,10 @@ def load_source_data(
         "SHIPPER": ("CLIENTE", "CLIENTES"),
         "EMISSOR": ("LOJAS E PA'S", "LOJAS E PAS"),
         "DT_ENTRADA_REVERSAS": ("DATA_ULTIMA_DATA", "DATA_EVENTO"),
+        "VENCIMENTO": (
+            "Vencimento", "vencimento", "DATA VENCIMENTO", "DATA_VENCIMENTO",
+            "DATA DE VENCIMENTO",
+        ),
     }
     for target, alternatives in aliases.items():
         if target not in frame.columns:
@@ -172,7 +177,6 @@ def load_source_data(
     for column in SOURCE_COLUMNS:
         if column not in frame.columns:
             frame[column] = pd.NA
-    frame = frame.loc[:, SOURCE_COLUMNS].copy()
     for column in [
         "STATUS_ATUAL", "DESCRICAO_ATUAL", "STATUS_TRATATIVA", "EMISSOR",
         "SOLICITANTE", "PROXIMA_UNIDADE", "SHIPPER", "TIPO",
@@ -184,7 +188,10 @@ def load_source_data(
 
     frame["SOLICITACAO"] = _excel_date(frame["SOLICITACAO"])
     frame["DT_EMISSAO"] = _excel_date(frame["DT_EMISSAO"])
+    frame["VENCIMENTO"] = _excel_date(frame["VENCIMENTO"])
     frame["DT_ENTRADA_REVERSAS"] = _excel_date(frame["DT_ENTRADA_REVERSAS"])
+    if "DATA_ULTIMA_DATA" in frame.columns:
+        frame["DATA_ULTIMA_DATA"] = _excel_date(frame["DATA_ULTIMA_DATA"])
     frame["VALOR_NF"] = pd.to_numeric(frame["VALOR_NF"], errors="coerce")
 
     # Retain PBIX fields where the export has them. Newer exports call the
@@ -254,4 +261,5 @@ def load_source_data(
 
     clients = frame.loc[frame["TIPO"].eq("Cliente")].copy()
     stores = frame.loc[frame["TIPO"].eq("Lojas e PAs")].copy()
+    frame.attrs["original_columns"] = original_columns
     return frame, clients, stores

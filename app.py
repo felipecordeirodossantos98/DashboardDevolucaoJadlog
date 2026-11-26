@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import hashlib
 import html
+import base64
 from io import BytesIO
 from datetime import date
 from pathlib import Path
 import unicodedata
+import uuid
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 import streamlit.components.v1 as components
+from openpyxl import Workbook
 
 from data import (
     AGE_BUCKETS,
@@ -25,10 +28,37 @@ from data import (
 
 
 ROOT = Path(__file__).resolve().parent
+lazy_export_table = components.declare_component(
+    "jadlog_lazy_export_table",
+    path=str(ROOT / "components" / "lazy_export_table"),
+)
 LOGO_PATH = ROOT / "images" / "jadlog_logo.webp"
 ICON_PATH = ROOT / "images" / "jadlog_icon.webp"
 RED = "#e5003d"
+VENCIMENTO_FILTER_OPTIONS = ["No prazo", "Vencido"]
 PAGES = ["BACKLOG", "ENTRADA", "CONTROLE LOJAS", "CONTROLE CLIENTES", "FAIXA DE VALOR", "Lista CTE"]
+PAGE_FILTER_KEYS = {
+    "BACKLOG": [
+        "backlog_emissor", "backlog_shipper", "backlog_status", "backlog_vencimento",
+        "backlog_sol", "backlog_evento", "backlog_emissao",
+    ],
+    "ENTRADA": ["entrada_aging", "entrada_vencimento", "entrada_data", "entrada_sol"],
+    "CONTROLE CLIENTES": [
+        "cc_aging_filter_v3", "cc_status_v2", "cc_shipper_v2", "cc_data_v2", "cc_sol_v2",
+    ],
+    "CONTROLE LOJAS": [
+        "cl_data", "cl_sol", "cl_aging", "cl_status", "cl_emissor",
+    ],
+    "FAIXA DE VALOR": [
+        "fv_faixa_valor", "fv_emissor", "fv_shipper", "fv_tipo", "fv_vencimento", "fv_data",
+    ],
+    "Lista CTE": [
+        "lista_vencimento", "lista_SHIPPER", "lista_EMISSOR", "lista_STATUS_ATUAL",
+        "lista_STATUS_TRATATIVA",
+        "lista_TIPO", "lista_MANIFESTO", "lista_PROXIMA_UNIDADE", "lista_Faixa_Valor",
+        "lista_sol", "lista_emissao", "lista_busca",
+    ],
+}
 CLIENT_ALLOWLIST = [
     'MERCADO LIVRE',
     'AMAZON',
@@ -115,7 +145,6 @@ EMISSOR_ALLOWLIST = [
     'LJ BELO HORIZONTE 03',
     'CO JUIZ DE FORA 02',
     'CO MARINGA 02',
-    'PA SAO PAULO 02',
     'PA SAO PAULO 26',
     'CO NITEROI 02',
     'CO RIO DE JANEIRO 06',
@@ -147,7 +176,6 @@ EMISSOR_ALLOWLIST = [
     'LJ BELO HORIZONTE 04',
     'LJ BELO HORIZONTE 05',
     'LJ SAO PAULO 11',
-    'PA SAO PAULO 05',
     'PA SAO PAULO 10',
     'CO ARACATUBA 01',
     'CO ARARAQUARA 02',
@@ -199,7 +227,7 @@ EMISSOR_ALLOWLIST = [
     'PA CARIACICA 01',
     'PA EXTREMA 02',
 ]
-BUCKET_LABELS = AGE_BUCKETS
+BUCKET_LABELS = [bucket for bucket in AGE_BUCKETS if bucket != "Sem dados"]
 
 st.set_page_config(
     page_title="Devolução | TC Reversas Jad-SAO",
@@ -209,13 +237,18 @@ st.set_page_config(
 )
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=4)
 def load_dashboard_data(
-    file_bytes: bytes, source_name: str
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    # The uploaded file contents are part of the cache key, so each import refreshes the app.
-    del source_name
-    return load_source_data(file_bytes)
+    source_fingerprint: str, _file_bytes: bytes, _source_name: str
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, tuple[str, ...]]:
+    # The fingerprint keys the cache; large workbook bytes are deliberately
+    # excluded from Streamlit's per-rerun argument hashing.
+    del source_fingerprint
+    base, clients, stores = load_source_data(_file_bytes)
+    original_columns = tuple(base.attrs.get("original_columns", ()))
+    if not original_columns:
+        raise ValueError("Não foi possível identificar as colunas originais da planilha.")
+    return base, clients, stores, original_columns
 
 
 with st.sidebar:
@@ -224,9 +257,9 @@ with st.sidebar:
     st.caption("REVERSAS · TC JAD-SAO")
     st.markdown("### Importar base")
     uploaded_file = st.file_uploader(
-        "Arquivo Excel (.xlsx)",
-        type=["xlsx"],
-        help="Importe a base Excel para abrir o painel. O arquivo fica ativo nesta sessão.",
+        "Arquivo Excel (.xlsx ou .xlsm)",
+        type=["xlsx", "xlsm"],
+        help="Importe uma base Excel para abrir o painel. O arquivo fica ativo nesta sessão.",
         key="dashboard_source_upload_v2",
     )
 
@@ -236,25 +269,42 @@ if uploaded_file is None:
 
 source_bytes = uploaded_file.getvalue()
 active_source = uploaded_file.name
-
-source_fingerprint = hashlib.sha256(source_bytes).hexdigest()
+upload_identity = (
+    getattr(uploaded_file, "file_id", None),
+    uploaded_file.name,
+    uploaded_file.size,
+)
+if (
+    upload_identity[0] is not None
+    and st.session_state.get("_dashboard_upload_identity") == upload_identity
+    and st.session_state.get("_dashboard_source_fingerprint")
+):
+    source_fingerprint = st.session_state["_dashboard_source_fingerprint"]
+else:
+    source_fingerprint = hashlib.sha256(source_bytes).hexdigest()
+    st.session_state["_dashboard_upload_identity"] = upload_identity
 if st.session_state.get("_dashboard_source_fingerprint") != source_fingerprint:
     filter_prefixes = (
-        "backlog_", "entrada_", "cc_", "cl_", "fv_", "lista_", "focus_"
+        "backlog_", "entrada_", "cc_", "cl_", "fv_", "lista_", "focus_",
+        "_lazy_export_pending_", "_multiselect_cleared_", "_preferred_period_",
     )
     for state_key in list(st.session_state):
         if state_key.startswith(filter_prefixes):
             del st.session_state[state_key]
-    load_dashboard_data.clear()
     st.session_state["_dashboard_source_fingerprint"] = source_fingerprint
 
 try:
-    BASE, CONTROL_CLIENTS, CONTROL_STORES = load_dashboard_data(
-        source_bytes, active_source
-    )
+    (
+        _RAW_BASE,
+        _RAW_CONTROL_CLIENTS,
+        _RAW_CONTROL_STORES,
+        _RAW_SOURCE_COLUMNS,
+    ) = load_dashboard_data(source_fingerprint, source_bytes, active_source)
 except Exception as error:
     st.error(f"Não foi possível importar {active_source}: {error}")
     st.stop()
+
+DETAIL_SOURCE_COLUMNS = list(_RAW_SOURCE_COLUMNS)
 
 
 def category_options(column: str, frame: pd.DataFrame | None = None) -> list[str]:
@@ -286,42 +336,55 @@ def allowed_emitter_mask(frame: pd.DataFrame) -> pd.Series:
     return matches
 
 
-# Category is derived from both fixed lists. Client list entries have priority
-# by default when both dimensions match; pair overrides remain available.
-BASE = BASE.copy()
-_client_rows = allowed_client_mask(BASE)
-_emitter_rows = allowed_emitter_mask(BASE)
-BASE["TIPO"] = "Rua"
-BASE.loc[_emitter_rows, "TIPO"] = "Lojas e PAs"
-BASE.loc[_client_rows, "TIPO"] = "Cliente"
-BASE.loc[_client_rows & _emitter_rows, "TIPO"] = "Conflito"
+@st.cache_data(show_spinner=False, max_entries=8)
+def prepare_dashboard_frames(
+    source_fingerprint: str,
+    assignment_pairs: tuple[tuple[str, str], ...],
+    _raw_base: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Cache allowlist classification and labels for this source and rule set."""
+    del source_fingerprint
+    base = _raw_base.copy()
+    client_names = base["SHIPPER"].map(normalize_dimension_name)
+    emitter_names = base["EMISSOR"].map(normalize_dimension_name)
+    client_rows = client_names.isin(CLIENT_ALLOWLIST_KEYS)
+    emitter_rows = emitter_names.isin(EMISSOR_ALLOWLIST_KEYS)
+
+    base["TIPO"] = "Rua"
+    base.loc[emitter_rows, "TIPO"] = "Lojas e PAs"
+    base.loc[client_rows, "TIPO"] = "Cliente"
+    conflicts = client_rows & emitter_rows
+    base.loc[conflicts, "TIPO"] = "Conflito"
+    pair_keys = client_names + "\x1f" + emitter_names
+    destinations = pair_keys.map(dict(assignment_pairs)).fillna("CLIENTES")
+    base.loc[conflicts & destinations.eq("CLIENTES"), "TIPO"] = "Cliente"
+    base.loc[conflicts & destinations.eq("LOJAS E PA'S"), "TIPO"] = "Lojas e PAs"
+    base.loc[~base["TIPO"].isin(["Cliente", "Lojas e PAs"]), "TIPO"] = "Rua"
+
+    client_labels = {normalize_dimension_name(name): name for name in CLIENT_ALLOWLIST}
+    emitter_labels = {
+        normalize_dimension_name(name): name for name in EMISSOR_ALLOWLIST
+        if normalize_dimension_name(name) != "(em branco)"
+    }
+    base["SHIPPER"] = client_names.map(client_labels).fillna(base["SHIPPER"])
+    base["EMISSOR"] = emitter_names.map(emitter_labels).fillna(base["EMISSOR"])
+    blank_emitter = base["EMISSOR"].isna() | base["EMISSOR"].astype("string").str.strip().eq("")
+    base.loc[blank_emitter, "EMISSOR"] = "(Em branco)"
+
+    clients = base.loc[base["TIPO"].eq("Cliente")].copy()
+    stores = base.loc[base["TIPO"].eq("Lojas e PAs")].copy()
+    classified = base.loc[base["TIPO"].isin(["Cliente", "Lojas e PAs"])].copy()
+    return base, clients, stores, classified
+
+
 _conflict_pair_assignments = st.session_state.get("backlog_conflict_pair_assignments_v2", {})
-_pair_keys = (
-    BASE["SHIPPER"].map(normalize_dimension_name)
-    + "\x1f"
-    + BASE["EMISSOR"].map(normalize_dimension_name)
+_assignment_pairs = tuple(sorted(_conflict_pair_assignments.items()))
+BASE, CONTROL_CLIENTS, CONTROL_STORES, CLASSIFIED_BASE = prepare_dashboard_frames(
+    source_fingerprint, _assignment_pairs, _RAW_BASE
 )
-_pair_destinations = _pair_keys.map(_conflict_pair_assignments).fillna("CLIENTES")
-BASE.loc[_client_rows & _emitter_rows & _pair_destinations.eq("CLIENTES"), "TIPO"] = "Cliente"
-BASE.loc[_client_rows & _emitter_rows & _pair_destinations.eq("LOJAS E PA'S"), "TIPO"] = "Lojas e PAs"
-# Keep all records outside the two assigned groups in Rua, including any
-# conflict or unexpected category value that was not assigned above.
-BASE.loc[~BASE["TIPO"].isin(["Cliente", "Lojas e PAs"]), "TIPO"] = "Rua"
-_client_labels = {normalize_dimension_name(name): name for name in CLIENT_ALLOWLIST}
-_emitter_labels = {
-    normalize_dimension_name(name): name for name in EMISSOR_ALLOWLIST
-    if normalize_dimension_name(name) != "(em branco)"
-}
-BASE["SHIPPER"] = BASE["SHIPPER"].map(
-    lambda value: _client_labels.get(normalize_dimension_name(value), value)
-)
-BASE["EMISSOR"] = BASE["EMISSOR"].map(
-    lambda value: "(Em branco)" if pd.isna(value) or not str(value).strip()
-    else _emitter_labels.get(normalize_dimension_name(value), value)
-)
-CONTROL_CLIENTS = BASE.loc[BASE["TIPO"].eq("Cliente")].copy()
-CONTROL_STORES = BASE.loc[BASE["TIPO"].eq("Lojas e PAs")].copy()
-CLASSIFIED_BASE = BASE.loc[BASE["TIPO"].isin(["Cliente", "Lojas e PAs"])].copy()
+XLSX_CACHE_EPOCH = hashlib.sha256(
+    f"{source_fingerprint}|{pd.Timestamp.today().date()}|{_assignment_pairs}".encode()
+).hexdigest()
 
 
 def _backlog_category_masks(frame: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
@@ -403,9 +466,16 @@ st.markdown(
     div[data-testid="stButton"] { width:100%; display:flex; justify-content:flex-end; }
     div[data-testid="stButton"] button { width:16px !important; min-width:16px !important; height:16px !important; min-height:16px !important; margin:0; padding:0; border:0 !important; border-radius:0; background:transparent !important; box-shadow:none !important; color:#566176; font-size:14px; line-height:16px; transform:none; }
     div[data-testid="stButton"] button:hover, div[data-testid="stButton"] button:focus { border:0 !important; background:transparent !important; box-shadow:none !important; color:#c90036; }
+    .st-key-page-filter-clear div[data-testid="stButton"] { justify-content:flex-end; }
+    .st-key-page-filter-clear div[data-testid="stButton"] button { width:auto !important; min-width:118px !important; height:36px !important; min-height:36px !important; padding:0 12px !important; border:1px solid #e1e5ec !important; border-radius:9px !important; background:#fff !important; box-shadow:none !important; color:#566176 !important; font-size:11px !important; line-height:normal !important; }
+    .st-key-page-filter-clear div[data-testid="stButton"] button:hover { border-color:#c90036 !important; color:#c90036 !important; }
     div[data-testid="stMetric"] { background:transparent; border:0; padding:0; min-height:0; }
     div[data-testid="stMetricLabel"] { color:#788295 !important; font-size:10px !important; }
     div[data-testid="stMetricValue"] { color:#202939; font-size:21px !important; font-weight:700; letter-spacing:-.02em; white-space:nowrap; }
+    .kpi-card { box-sizing:border-box; display:flex; align-items:center; gap:10px; width:173px; min-width:173px; max-width:173px; height:84px; min-height:84px; padding:10px 11px; border:1px solid #d1d5dd; border-radius:9px; background:#fff; overflow:hidden; }
+    .kpi-copy { flex:1; min-width:0; }
+    .kpi-label { overflow:hidden; color:#30343b; font-size:10px; line-height:1.3; white-space:nowrap; text-overflow:ellipsis; }
+    .kpi-value { overflow:hidden; color:#202939; font-size:16px; font-weight:700; line-height:1.2; letter-spacing:-.02em; white-space:nowrap; text-overflow:ellipsis; }
     .kpi-icon { display:grid; place-items:center; width:38px; height:38px; background:#fff0f4; color:#c90036; font-size:19px; font-weight:700; border-radius:12px; }
     div[data-testid="stSelectbox"] label, div[data-testid="stMultiSelect"] label, div[data-testid="stDateInput"] label, div[data-testid="stTextInput"] label, div[data-testid="stCheckbox"] label, div[data-testid="stRadio"] > label, div[data-testid="stSegmentedControl"] label { color:#687386 !important; font-size:10px !important; font-weight:600 !important; text-transform:none; }
     div[data-testid="stSelectbox"], div[data-testid="stMultiSelect"], div[data-testid="stDateInput"], div[data-testid="stTextInput"] { margin:0 0 4px; }
@@ -457,11 +527,91 @@ def esc(value: object) -> str:
     return html.escape("" if pd.isna(value) else str(value))
 
 
-def dataframe_to_xlsx(frame: pd.DataFrame) -> bytes:
+def dataframe_xlsx_cache_key(
+    frame: pd.DataFrame, *, stable_source_rows: bool = False
+) -> str:
+    if stable_source_rows:
+        data_hashes = pd.util.hash_pandas_object(frame.index, index=False).values.tobytes()
+    else:
+        data_hashes = pd.util.hash_pandas_object(frame, index=True).values.tobytes()
+    key_material = b"\x1f".join(
+        [
+            XLSX_CACHE_EPOCH.encode("ascii"),
+            "\x1f".join(str(column) for column in frame.columns).encode("utf-8"),
+            data_hashes,
+        ]
+    )
+    return hashlib.sha256(key_material).hexdigest()
+
+
+@st.cache_data(show_spinner=False, max_entries=512)
+def _cached_dataframe_to_xlsx(cache_key: str, _frame: pd.DataFrame) -> bytes:
+    del cache_key
+    frame = _frame
     output = BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        frame.to_excel(writer, index=False, sheet_name="Dados")
+    workbook = Workbook(write_only=True)
+    worksheet = workbook.create_sheet("Dados")
+    worksheet.append([str(column) for column in frame.columns])
+    for row in frame.itertuples(index=False, name=None):
+        values = []
+        for value in row:
+            if pd.isna(value):
+                values.append(None)
+            elif isinstance(value, pd.Timestamp):
+                values.append(value.to_pydatetime())
+            elif hasattr(value, "item") and not isinstance(value, (str, bytes)):
+                values.append(value.item())
+            else:
+                values.append(value)
+        worksheet.append(values)
+    workbook.save(output)
     return output.getvalue()
+
+
+def dataframe_to_xlsx(
+    frame: pd.DataFrame, *, cache_key: str | None = None
+) -> bytes:
+    resolved_key = cache_key or dataframe_xlsx_cache_key(frame)
+    return _cached_dataframe_to_xlsx(resolved_key, frame)
+
+
+def detail_export_frame(records: pd.DataFrame) -> pd.DataFrame:
+    """Return original imported columns plus the dashboard type and aging."""
+    source_columns = [
+        column for column in DETAIL_SOURCE_COLUMNS
+        if column not in {"TIPO", "AGING"}
+    ]
+    detail_columns: dict[str, pd.Series] = {}
+    for column in source_columns:
+        if column in records.columns:
+            detail_columns[column] = records[column]
+        elif column in _RAW_BASE.columns:
+            detail_columns[column] = _RAW_BASE[column].reindex(records.index)
+        else:
+            detail_columns[column] = pd.Series(pd.NA, index=records.index)
+    details = pd.DataFrame(detail_columns, index=records.index)
+
+    if "TIPO" in records.columns:
+        details["TIPO"] = records["TIPO"]
+    else:
+        details["TIPO"] = BASE["TIPO"].reindex(records.index)
+
+    age_column = next(
+        (
+            column for column in ("DATA_ULTIMA_DATA", "DT_ENTRADA_REVERSAS", "DATA_EVENTO")
+            if column in records.columns or column in _RAW_BASE.columns
+        ),
+        None,
+    )
+    if age_column is None:
+        details["AGING"] = pd.NA
+    else:
+        age_source = records if age_column in records.columns else _RAW_BASE
+        age_dates = pd.to_datetime(age_source[age_column], errors="coerce")
+        age_dates = age_dates.reindex(records.index)
+        aging = powerbi_aging_bucket(age_dates)
+        details["AGING"] = aging.where(age_dates.notna(), pd.NA)
+    return details
 
 
 def is_total_row(frame: pd.DataFrame) -> bool:
@@ -471,7 +621,12 @@ def is_total_row(frame: pd.DataFrame) -> bool:
     return isinstance(label, str) and label.strip().casefold() == "total"
 
 
-def sticky_table_html(frame: pd.DataFrame, *, bar_column: str | None = None) -> str:
+def sticky_table_html(
+    frame: pd.DataFrame,
+    *,
+    bar_column: str | None = None,
+    cell_links: dict[tuple[int, str], str] | None = None,
+) -> str:
     columns = list(frame.columns)
 
     def cell_value(value: object, column: str) -> str:
@@ -496,7 +651,12 @@ def sticky_table_html(frame: pd.DataFrame, *, bar_column: str | None = None) -> 
             return decimal_br(float(value), 2)
         return esc(value)
 
-    def render_row(row: pd.Series, *, total: bool = False) -> str:
+    def render_row(
+        row: pd.Series,
+        row_index: int,
+        *,
+        total: bool = False,
+    ) -> str:
         cells = []
         for column, value in row.items():
             numeric = (
@@ -509,7 +669,14 @@ def sticky_table_html(frame: pd.DataFrame, *, bar_column: str | None = None) -> 
             if bar_column is not None and column == bar_column:
                 classes.append("distribution")
             class_name = f' class="{" ".join(classes)}"' if classes else ""
-            cells.append(f"<td{class_name}>{cell_value(value, str(column))}</td>")
+            content = cell_value(value, str(column))
+            cell_link = (cell_links or {}).get((row_index, str(column)))
+            if cell_link is not None:
+                content = (
+                    f'<a class="table-export-link" href="#" '
+                    f'data-cell-id="{esc(cell_link)}">{content}</a>'
+                )
+            cells.append(f"<td{class_name}>{content}</td>")
         row_class = ' class="total-row"' if total else ""
         return f"<tr{row_class}>{''.join(cells)}</tr>"
 
@@ -521,8 +688,15 @@ def sticky_table_html(frame: pd.DataFrame, *, bar_column: str | None = None) -> 
     )
     has_total = is_total_row(frame)
     body_frame = frame.iloc[:-1] if has_total else frame
-    body = "".join(render_row(row) for _, row in body_frame.iterrows())
-    total = "".join(render_row(row, total=True) for _, row in frame.tail(1).iterrows()) if has_total else ""
+    body = "".join(
+        render_row(row, row_index)
+        for row_index, (_, row) in enumerate(body_frame.iterrows())
+    )
+    total = (
+        render_row(frame.iloc[-1], len(body_frame), total=True)
+        if has_total
+        else ""
+    )
     shipper_summary = columns[:3] in (["SHIPPER", "QTDE", "%"], ["CLIENTES", "QTDE", "%"])
     table_class = "shipper-summary" if shipper_summary else ""
     return f"""
@@ -546,6 +720,8 @@ def sticky_table_html(frame: pd.DataFrame, *, bar_column: str | None = None) -> 
       .progress {{ display: inline-block; width: 56px; height: 7px; flex: 0 0 56px; overflow: hidden; vertical-align: middle; border-radius: 10px; background: #fff0f4; }}
       .progress span {{ display: block; height: 100%; background: #e5003d; border-radius: inherit; }}
       .progress-label {{ min-width: 43px; text-align: right; }}
+      a.table-export-link {{ color: inherit; text-decoration: underline; text-decoration-color: #aeb7c5; text-underline-offset: 2px; cursor: pointer; }}
+      a.table-export-link:hover {{ color: #e5003d; text-decoration-color: #e5003d; }}
     </style>
     <div class="scroll-area"><table class="{table_class}"><thead><tr>{header}</tr></thead>
       <tbody>{body}</tbody>{f'<tfoot>{total}</tfoot>' if has_total else ''}
@@ -560,6 +736,7 @@ def show_table_focus(
     bar_column: str | None = None,
     *,
     native: bool = False,
+    cell_export_context: tuple[pd.DataFrame, str | None, str | None] | None = None,
 ) -> None:
     st.markdown(f"**{esc(title)}**")
     if native:
@@ -567,12 +744,134 @@ def show_table_focus(
         if "CTE" in frame.columns:
             st.caption(f"Total · {number_br(frame['CTE'].notna().sum())}")
         return
+    if cell_export_context is not None:
+        records, row_field, bucket_field = cell_export_context
+        _linked_table(
+            frame,
+            title=f"{title}_focus",
+            height=720,
+            bar_column=bar_column,
+            export_records=records,
+            row_field=row_field,
+            bucket_field=bucket_field,
+        )
+        return
     focus_height = min(720, max(150, 54 + len(frame) * 32))
     components.html(
         sticky_table_html(frame, bar_column=bar_column),
         height=focus_height,
         scrolling=False,
     )
+
+
+def _linked_table(
+    frame: pd.DataFrame,
+    *,
+    title: str,
+    height: int,
+    bar_column: str | None,
+    export_records: pd.DataFrame,
+    row_field: str | None,
+    bucket_field: str | None,
+) -> None:
+    """Render the original HTML table and generate each XLSX after its click."""
+    row_labels = (
+        export_records[row_field].fillna("(Em branco)").astype(str)
+        if row_field is not None
+        else pd.Series("Total", index=export_records.index, dtype="string")
+    )
+    rows_by_label = row_labels.groupby(row_labels, sort=False).indices
+    buckets_by_label: dict[str, object] = {}
+    cells_by_pair: dict[tuple[str, str], object] = {}
+    if bucket_field is not None:
+        bucket_labels = export_records[bucket_field].fillna("(Em branco)").astype(str)
+        buckets_by_label = bucket_labels.groupby(bucket_labels, sort=False).indices
+        pairs = pd.DataFrame(
+            {"row": row_labels.to_numpy(), "bucket": bucket_labels.to_numpy()}
+        )
+        cells_by_pair = pairs.groupby(["row", "bucket"], sort=False).indices
+
+    all_positions = list(range(len(export_records)))
+    table_slug = "".join(
+        character.lower() if character.isalnum() else "_"
+        for character in title
+    ).strip("_")
+
+    def export_positions(row_name: str, column: str) -> object | None:
+        if row_name == "Total" or row_field is None:
+            if bucket_field is not None and column != "Total":
+                return buckets_by_label.get(str(column))
+            return all_positions
+        if bucket_field is not None and column != "Total":
+            return cells_by_pair.get((row_name, str(column)))
+        return rows_by_label.get(row_name)
+
+    body = frame.iloc[:-1] if is_total_row(frame) else frame
+    rows = list(body.iterrows())
+    if is_total_row(frame):
+        rows.append((len(frame) - 1, frame.iloc[-1]))
+    cell_exports: dict[str, tuple[tuple[int, ...], str]] = {}
+    cell_links: dict[tuple[int, str], str] = {}
+    for display_index, (_, row) in enumerate(rows):
+        row_name = str(row.iloc[0])
+        for column_index, (column, value) in enumerate(row.items()):
+            if not pd.api.types.is_number(value) or isinstance(value, bool):
+                continue
+            positions = export_positions(row_name, str(column))
+            if positions is None or not len(positions):
+                continue
+            row_slug = "".join(
+                character.lower() if character.isalnum() else "_"
+                for character in row_name
+            ).strip("_") or "total"
+            column_slug = "".join(
+                character.lower() if character.isalnum() else "_"
+                for character in str(column)
+            ).strip("_")
+            filename = f"{table_slug}_{row_slug}_{column_slug}.xlsx"
+            cell_id = f"{display_index}_{column_index}"
+            cell_links[(display_index, str(column))] = cell_id
+            cell_exports[cell_id] = (
+                tuple(int(position) for position in positions),
+                filename,
+            )
+    table_html = sticky_table_html(
+        frame,
+        bar_column=bar_column,
+        cell_links=cell_links,
+    )
+    state_key = f"_lazy_export_pending_{table_slug}"
+    pending_download = st.session_state.get(state_key)
+    action = lazy_export_table(
+        table_html=table_html,
+        height=int(height),
+        download=pending_download,
+        key=f"lazy_export_table_{table_slug}",
+        default=None,
+    )
+    if isinstance(action, dict):
+        if action.get("type") == "export" and pending_download is None:
+            selected = cell_exports.get(str(action.get("cell_id", "")))
+            if selected is not None:
+                positions, filename = selected
+                details = detail_export_frame(
+                    export_records.iloc[list(positions)]
+                )
+                cache_key = dataframe_xlsx_cache_key(
+                    details,
+                    stable_source_rows=True,
+                )
+                xlsx_bytes = dataframe_to_xlsx(details, cache_key=cache_key)
+                st.session_state[state_key] = {
+                    "token": uuid.uuid4().hex,
+                    "filename": filename,
+                    "base64": base64.b64encode(xlsx_bytes).decode("ascii"),
+                }
+                st.rerun()
+        elif action.get("type") == "downloaded" and pending_download is not None:
+            if action.get("token") == pending_download.get("token"):
+                del st.session_state[state_key]
+                st.rerun()
 
 
 def table_panel(
@@ -587,8 +886,12 @@ def table_panel(
     max_rows: int | None = None,
     key_suffix: str = "",
     export_name: str | None = None,
+    export_frame: pd.DataFrame | None = None,
+    cell_export_context: tuple[pd.DataFrame, str | None, str | None] | None = None,
 ) -> None:
-    view = frame.copy()
+    # Older cached matrix frames may still carry this bucket; hide it at the
+    # shared table renderer so standard, linked, and focus tables stay aligned.
+    view = frame.drop(columns=["Sem dados"], errors="ignore").copy()
     has_total = is_total_row(view)
     if max_rows is not None and len(view) > max_rows:
         view = pd.concat(
@@ -623,25 +926,51 @@ def table_panel(
         if key_suffix:
             focus_key = f"{focus_key}_{key_suffix}"
         if export_name:
+            source_export = export_frame if export_frame is not None else view
+
+            def build_export() -> bytes:
+                export_details = detail_export_frame(source_export)
+                export_cache_key = dataframe_xlsx_cache_key(
+                    export_details, stable_source_rows=export_frame is not None
+                )
+                return dataframe_to_xlsx(export_details, cache_key=export_cache_key)
+
             with actions_col:
                 buttons_col, _right_padding = st.columns([1, .08], gap=None)
                 with buttons_col:
                     with st.container(horizontal=True, horizontal_alignment="right", vertical_alignment="center", gap="small"):
                         st.download_button(
                             "⇩",
-                            data=dataframe_to_xlsx(view),
+                            data=build_export,
                             file_name=export_name,
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             key=f"export_{key_suffix or title.casefold().replace(' ', '_')}",
                             help="Exportar tabela em XLSX",
+                            on_click="ignore",
                         )
                         focus_clicked = st.button("⛶", key=focus_key, help="Abrir em modo foco")
         else:
             with focus_col:
                 focus_clicked = st.button("⛶", key=focus_key, help="Abrir em modo foco")
         if focus_clicked:
-            show_table_focus(title, view, bar_column)
-        if has_total and not view.empty:
+            show_table_focus(
+                title,
+                view,
+                bar_column,
+                cell_export_context=cell_export_context,
+            )
+        if cell_export_context is not None:
+            export_records, row_field, bucket_field = cell_export_context
+            _linked_table(
+                view,
+                height=height,
+                bar_column=bar_column,
+                export_records=export_records,
+                row_field=row_field,
+                bucket_field=bucket_field,
+                title=f"{title}_{key_suffix}" if key_suffix else title,
+            )
+        elif has_total and not view.empty:
             components.html(
                 sticky_table_html(view, bar_column=bar_column),
                 height=height,
@@ -654,25 +983,24 @@ def table_panel(
 
 
 def kpi(label: str, value: str, icon: str, note: str = "") -> None:
-    with st.container(border=True):
-        icon_col, metric_col = st.columns([.22, 1], gap="small", vertical_alignment="center")
-        with icon_col:
-            st.markdown(f'<div class="kpi-icon">{esc(icon)}</div>', unsafe_allow_html=True)
-        with metric_col:
-            st.metric(label=label, value=value, help=note or None)
+    st.markdown(
+        '<div class="kpi-card">'
+        f'<div class="kpi-icon">{esc(icon)}</div>'
+        '<div class="kpi-copy">'
+        f'<div class="kpi-label" title="{esc(label)}">{esc(label)}</div>'
+        f'<div class="kpi-value" title="{esc(value)}">{esc(value)}</div>'
+        '</div></div>',
+        unsafe_allow_html=True,
+    )
 
 
-def metric_cards(columns: list, df: pd.DataFrame, *, show_open: bool = True) -> None:
+def metric_cards(columns: list, df: pd.DataFrame) -> None:
     amount = float(df["VALOR_NF"].sum()) if not df.empty else 0.0
     count = int(df["CTE"].notna().sum()) if not df.empty else 0
-    open_pct = float(df["FINALIZADO?"].eq("EM ABERTO").mean()) if count else 0.0
     with columns[0]:
         kpi("Soma de VALOR_NF", money_short(amount), "＄", "")
     with columns[1]:
-        kpi("Contagem de CTE" if show_open else "Quantidade", count_short(count), "▤", "")
-    if show_open:
-        with columns[2]:
-            kpi("% Em Aberto", f"{open_pct:.2%}".replace(".", ","), "↗", "")
+        kpi("Quantidade", count_short(count), "▤", "")
 
 
 def header(page: str, *, backlog_type: bool = False) -> None:
@@ -686,12 +1014,44 @@ def header(page: str, *, backlog_type: bool = False) -> None:
         '<span class="divider">/</span><span class="branch">TC REVERSAS JAD-SAO</span></div></div>'
         f'<div class="report-subtitle"><b>Dados até</b><br><strong>{cutoff_label}</strong></div></div>'
     )
-    st.markdown(header_markup, unsafe_allow_html=True)
+    header_columns = st.columns([6, 1], gap="small", vertical_alignment="center")
+    with header_columns[0]:
+        st.markdown(header_markup, unsafe_allow_html=True)
+    with header_columns[1]:
+        with st.container(key="page-filter-clear"):
+            st.button(
+                "Limpar filtros",
+                key=f"clear_filters_{page.lower().replace(' ', '_')}",
+                on_click=clear_page_filters,
+                args=(page,),
+                help="Restaurar os filtros desta aba",
+            )
 
 
-def kpi_row(df: pd.DataFrame, *, show_open: bool = False, fixed_value: float | None = None) -> None:
-    cols = st.columns([1, 1, 1] if show_open else [1, 1], gap="small")
-    metric_cards(cols, df, show_open=show_open)
+def clear_page_filters(page: str) -> None:
+    """Reset only the current page's filter widgets."""
+    date_filter_keys = {
+        "backlog_sol", "backlog_evento", "backlog_emissao",
+        "entrada_data", "entrada_sol", "cc_data_v2", "cc_sol_v2",
+        "cl_data", "cl_sol", "fv_data", "lista_sol", "lista_emissao",
+    }
+    for key in PAGE_FILTER_KEYS.get(page, []):
+        if key in date_filter_keys:
+            st.session_state[key] = None
+        elif key == "lista_busca":
+            st.session_state[key] = ""
+        else:
+            # Explicitly clear widget state in the button callback so Streamlit
+            # cannot restore the prior selection when the widget is recreated.
+            st.session_state[key] = []
+        for state_key in (f"_preferred_period_{key}", f"_multiselect_cleared_{key}"):
+            if state_key in st.session_state:
+                del st.session_state[state_key]
+
+
+def kpi_row(df: pd.DataFrame, *, fixed_value: float | None = None) -> None:
+    cols = st.columns([1, 1], gap="small")
+    metric_cards(cols, df)
 
 
 def period_picker(df: pd.DataFrame, field: str, label: str, key: str, *, default: tuple[date, date] | None = None) -> tuple[date, date] | None:
@@ -743,10 +1103,265 @@ def filtered(df: pd.DataFrame, fields: dict[str, list[str]]) -> pd.DataFrame:
     return out
 
 
+def filter_vencimento(df: pd.DataFrame, selected: list[str]) -> pd.DataFrame:
+    if not selected:
+        return df
+    vencimento = df["VENCIMENTO"]
+    if not pd.api.types.is_datetime64_any_dtype(vencimento):
+        vencimento = pd.to_datetime(vencimento, errors="coerce")
+    today = pd.Timestamp.today().normalize()
+    mask = pd.Series(False, index=df.index)
+    if "No prazo" in selected:
+        mask |= vencimento.ge(today)
+    if "Vencido" in selected:
+        mask |= vencimento.lt(today)
+    return df.loc[mask]
+
+
 def filter_select(label: str, options: list[str], key: str) -> list[str]:
-    return st.multiselect(label, options, key=key, placeholder="Todos", label_visibility="visible")
+    return st.multiselect(
+        label,
+        options,
+        key=key,
+        placeholder="Todos",
+        label_visibility="visible",
+        on_change=_remember_multiselect_change,
+        args=(key,),
+    )
 
 
+def _selection_values(value: object) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    return [str(value)] if value else []
+
+
+def _multiselect_clear_marker(key: str) -> str:
+    return f"_multiselect_cleared_{key}"
+
+
+def _remember_multiselect_change(key: str) -> None:
+    """Record an explicit Clear all action before cascading filters rerun."""
+    st.session_state[_multiselect_clear_marker(key)] = not bool(
+        _selection_values(st.session_state.get(key, []))
+    )
+
+
+def _consume_multiselect_clear(key: str) -> bool:
+    marker = _multiselect_clear_marker(key)
+    cleared = bool(st.session_state.get(marker, False))
+    if marker in st.session_state:
+        del st.session_state[marker]
+    if cleared:
+        st.session_state[key] = []
+    return cleared
+
+
+def _preferred_period_key(key: str) -> str:
+    return f"_preferred_period_{key}"
+
+
+def _remember_user_period_change(key: str) -> None:
+    """Keep the user's date selection separate from temporary synchronized bounds."""
+    value = st.session_state.get(key)
+    if not isinstance(value, (tuple, list)) or len(value) != 2:
+        return
+    try:
+        start, end = pd.Timestamp(value[0]), pd.Timestamp(value[1])
+    except (TypeError, ValueError, OverflowError):
+        return
+    if pd.isna(start) or pd.isna(end):
+        return
+    st.session_state[_preferred_period_key(key)] = (start.date(), end.date())
+
+
+def _apply_filter_spec(frame: pd.DataFrame, spec: dict, selected: list[str]) -> pd.DataFrame:
+    if spec.get("kind") == "vencimento":
+        return filter_vencimento(frame, selected)
+    return filtered(frame, {spec["field"]: selected})
+
+
+def synchronized_multiselects(
+    frame: pd.DataFrame,
+    specs: list[dict],
+    columns: list | None = None,
+) -> dict[str, list[str]]:
+    """Render cascading filters whose options reflect every other active filter."""
+    selections = {}
+    for spec in specs:
+        key = spec["key"]
+        _consume_multiselect_clear(key)
+        selections[key] = _selection_values(st.session_state.get(key, []))
+    for index, spec in enumerate(specs):
+        candidates = frame
+        for other in specs:
+            if other["key"] != spec["key"]:
+                candidates = _apply_filter_spec(candidates, other, selections[other["key"]])
+
+        if spec.get("kind") == "vencimento":
+            options = [
+                value for value in VENCIMENTO_FILTER_OPTIONS
+                if not filter_vencimento(candidates, [value]).empty
+            ]
+        else:
+            values = candidates[spec["field"]].fillna("").astype(str).str.strip()
+            present = set(values[values.ne("")])
+            if spec.get("include_blank") and (values.eq("").any()):
+                present.add("(Em branco)")
+            allowed = spec.get("options")
+            options = [value for value in allowed if value in present] if allowed is not None else sorted(present, key=str.casefold)
+
+        key = spec["key"]
+        current = _selection_values(st.session_state.get(key, []))
+        selected = [value for value in selections[key] if value in options]
+        # Only write back when dynamic options invalidated a previous choice.
+        # Avoid reassigning an already-cleared widget value before it renders,
+        # which can make Streamlit restore the old selection on rerun.
+        if selected != current:
+            st.session_state[key] = selected
+        selections[key] = selected
+        if columns is None:
+            selections[spec["key"]] = st.multiselect(
+                spec["label"], options, key=spec["key"],
+                placeholder=spec.get("placeholder", "Todos"),
+                on_change=_remember_multiselect_change,
+                args=(spec["key"],),
+            )
+        else:
+            with columns[index]:
+                selections[spec["key"]] = st.multiselect(
+                    spec["label"], options, key=spec["key"],
+                    placeholder=spec.get("placeholder", "Todos"),
+                    on_change=_remember_multiselect_change,
+                    args=(spec["key"],),
+                )
+    return selections
+
+
+def synchronized_periods(
+    frame: pd.DataFrame,
+    period_specs: list[dict],
+    filter_specs: list[dict] | None = None,
+    columns: list | None = None,
+) -> dict[str, tuple[date, date] | None]:
+    """Make each date range respond to the other dates and active dimension filters."""
+    def as_date(value: object) -> date | None:
+        if value is None:
+            return None
+        try:
+            parsed = pd.Timestamp(value)
+            return None if pd.isna(parsed) else parsed.date()
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    def complete_period(value: object) -> tuple[date, date] | None:
+        if not isinstance(value, (tuple, list)) or len(value) != 2:
+            return None
+        start, end = as_date(value[0]), as_date(value[1])
+        return (start, end) if start is not None and end is not None else None
+
+    filter_specs = filter_specs or []
+    for spec in filter_specs:
+        _consume_multiselect_clear(spec["key"])
+    selections = {
+        spec["key"]: _selection_values(st.session_state.get(spec["key"], []))
+        for spec in filter_specs
+    }
+    preferred_periods: dict[str, tuple[date, date] | None] = {}
+    for spec in period_specs:
+        key = spec["key"]
+        preferred_key = _preferred_period_key(key)
+        preferred = complete_period(st.session_state.get(preferred_key))
+        if preferred is None:
+            # Migrate older sessions from the source date range, not the old
+            # widget value: earlier versions overwrote that value with the
+            # temporary limits produced by cascading filters.
+            source_dates = pd.to_datetime(frame[spec["field"]], errors="coerce").dropna()
+            if not source_dates.empty:
+                source_lo, source_hi = source_dates.min().date(), source_dates.max().date()
+                default = spec.get("default")
+                start = min(max(default[0], source_lo), source_hi) if default else source_lo
+                preferred = (start, source_hi)
+                st.session_state[preferred_key] = preferred
+        preferred_periods[key] = preferred
+    periods = dict(preferred_periods)
+
+    for index, spec in enumerate(period_specs):
+        candidates = frame
+        for other in period_specs:
+            if other["key"] != spec["key"] and periods[other["key"]] is not None:
+                candidates = apply_period(
+                    candidates, other["field"], periods[other["key"]],
+                    include_missing_when_full=other.get("include_missing_when_full", False),
+                )
+        for filter_spec in filter_specs:
+            candidates = _apply_filter_spec(
+                candidates, filter_spec, selections[filter_spec["key"]]
+            )
+
+        values = pd.to_datetime(candidates[spec["field"]], errors="coerce").dropna()
+        if values.empty:
+            values = pd.to_datetime(frame[spec["field"]], errors="coerce").dropna()
+        if values.empty:
+            periods[spec["key"]] = None
+            continue
+
+        lo, hi = values.min().date(), values.max().date()
+        prior = preferred_periods[spec["key"]]
+        key = spec["key"]
+        raw_value = st.session_state.get(key)
+        is_partial_pair = (
+            isinstance(raw_value, (tuple, list))
+            and len(raw_value) == 2
+            and complete_period(raw_value) is None
+        )
+        if is_partial_pair or (prior is None and key in st.session_state and raw_value is None):
+            # Streamlit returns a partial pair while the user is picking the
+            # second endpoint. Keep that in-progress choice instead of
+            # replacing it with the saved range or comparing a date with None.
+            if raw_value is None:
+                widget_value = None
+            else:
+                partial = [as_date(value) for value in raw_value[:2]]
+                widget_value = tuple(
+                    min(max(value, lo), hi) if value is not None else None
+                    for value in partial
+                )
+        elif prior is None:
+            default = spec.get("default")
+            start = min(max(default[0], lo), hi) if default else lo
+            end = hi
+            widget_value = (start, end)
+            preferred_periods[key] = widget_value
+            st.session_state[_preferred_period_key(key)] = widget_value
+        else:
+            # Apply other filters' limits to the visible widget only. Keep the
+            # preferred range intact so clearing a filter restores it.
+            start = max(prior[0], lo)
+            end = min(prior[1], hi)
+            if start > end:
+                start, end = lo, hi
+            widget_value = (start, end)
+        if st.session_state.get(key) != widget_value:
+            st.session_state[key] = widget_value
+        if columns is None:
+            result = st.date_input(
+                spec["label"], min_value=lo, max_value=hi,
+                format="DD/MM/YYYY", key=key,
+                on_change=_remember_user_period_change, args=(key,),
+            )
+        else:
+            with columns[index]:
+                result = st.date_input(
+                    spec["label"], min_value=lo, max_value=hi,
+                    format="DD/MM/YYYY", key=key,
+                    on_change=_remember_user_period_change, args=(key,),
+                )
+        periods[key] = complete_period(result)
+    return periods
+
+
+@st.cache_data(show_spinner=False, max_entries=256)
 def summary_table(
     df: pd.DataFrame,
     field: str,
@@ -782,6 +1397,7 @@ def summary_table(
     return pd.concat([out, total], ignore_index=True)
 
 
+@st.cache_data(show_spinner=False, max_entries=256)
 def matrix_table(
     df: pd.DataFrame,
     row_field: str,
@@ -796,13 +1412,17 @@ def matrix_table(
     display_field = dimension_labels.get(row_field, row_field.replace("_", " "))
     if df.empty:
         return pd.DataFrame(columns=[display_field, *labels, "Total"])
-    pivot = pd.crosstab(df[row_field].fillna("(Em branco)"), df[bucket_field].fillna("(Em branco)"))
+    row_values = df[row_field].fillna("(Em branco)")
+    pivot = pd.crosstab(row_values, df[bucket_field].fillna("(Em branco)"))
     columns = order or labels
     pivot = pivot.reindex(columns=columns, fill_value=0)
-    pivot["Total"] = pivot.sum(axis=1)
+    # Keep records with a missing aging bucket in the row/grand totals even
+    # though they do not appear in one of the visible aging columns.
+    pivot["Total"] = row_values.value_counts(dropna=False).reindex(pivot.index, fill_value=0)
     all_rows = pivot.copy()
     pivot = pivot.sort_values("Total", ascending=False).head(limit)
-    grand = {name: int(all_rows[name].sum()) for name in columns + ["Total"]}
+    grand = {name: int(all_rows[name].sum()) for name in columns}
+    grand["Total"] = int(len(df))
     grand[row_field] = "Total"
     pivot = pivot.reset_index()
     pivot = pd.concat([pivot, pd.DataFrame([grand])], ignore_index=True)
@@ -819,10 +1439,23 @@ def aging_totals(df: pd.DataFrame, label: str, bucket_field: str) -> pd.DataFram
 
 
 def footer_detail(df: pd.DataFrame) -> None:
-    """Show only the CTE detail as a visible, scrollable native Streamlit dataframe."""
-    columns = ["CTE", "PEDIDO", "STATUS_ATUAL", "SOLICITACAO", "DESCRICAO_ATUAL", "STATUS_TRATATIVA"]
-    chosen = df.loc[:, columns].copy()
-    chosen["SOLICITACAO"] = pd.to_datetime(chosen["SOLICITACAO"], errors="coerce").dt.strftime("%d/%m/%Y")
+    """Show original imported detail columns with dashboard classifications."""
+    chosen = detail_export_frame(df)
+    detail_column_config: dict[str, object] = {
+        "CTE": st.column_config.TextColumn("CTE", width="medium"),
+        "PEDIDO": st.column_config.TextColumn("PEDIDO", width="medium"),
+        "STATUS_ATUAL": st.column_config.TextColumn("STATUS_ATUAL", width="medium"),
+        "DESCRICAO_ATUAL": st.column_config.TextColumn("DESCRICAO_ATUAL", width="medium"),
+        "STATUS_TRATATIVA": st.column_config.TextColumn("STATUS_TRATATIVA", width="large"),
+        "RESULTADO DA CONSULTA": st.column_config.TextColumn("RESULTADO DA CONSULTA", width="large"),
+        "TIPO": st.column_config.TextColumn("TIPO", width="medium"),
+        "AGING": st.column_config.TextColumn("AGING", width="small"),
+    }
+    for column in chosen.columns:
+        if pd.api.types.is_datetime64_any_dtype(chosen[column]):
+            detail_column_config[column] = st.column_config.DateColumn(
+                column, format="DD/MM/YYYY", width="small"
+            )
 
     with st.container(border=True):
         title_col, actions_col = st.columns([1, .24], gap="small", vertical_alignment="center")
@@ -834,11 +1467,17 @@ def footer_detail(df: pd.DataFrame) -> None:
                 with st.container(horizontal=True, horizontal_alignment="right", vertical_alignment="center", gap="small"):
                     st.download_button(
                         "⇩",
-                        data=dataframe_to_xlsx(chosen),
+                        data=lambda: dataframe_to_xlsx(
+                            chosen,
+                            cache_key=dataframe_xlsx_cache_key(
+                                chosen, stable_source_rows=True
+                            ),
+                        ),
                         file_name="detalhes_ctes.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         key="export_detail_cte",
                         help="Exportar tabela em XLSX",
+                        on_click="ignore",
                     )
                     focus_clicked = st.button("⛶", key="focus_detail_cte", help="Abrir tabela geral em modo foco")
         if focus_clicked:
@@ -849,14 +1488,7 @@ def footer_detail(df: pd.DataFrame) -> None:
             use_container_width=True,
             hide_index=True,
             height=280,
-            column_config={
-                "CTE": st.column_config.TextColumn("CTE", width="medium"),
-                "PEDIDO": st.column_config.TextColumn("PEDIDO", width="medium"),
-                "STATUS_ATUAL": st.column_config.TextColumn("STATUS_ATUAL", width="medium"),
-                "SOLICITACAO": st.column_config.TextColumn("SOLICITACAO", width="small"),
-                "DESCRICAO_ATUAL": st.column_config.TextColumn("DESCRICAO_ATUAL", width="medium"),
-                "STATUS_TRATATIVA": st.column_config.TextColumn("STATUS_TRATATIVA", width="large"),
-            },
+            column_config=detail_column_config,
         )
         st.caption(f"Total · {number_br(chosen['CTE'].notna().sum())}")
 
@@ -880,28 +1512,44 @@ def backlog_page() -> None:
         ]
 
     # First row mirrors the small Power BI cards and slicers.
-    top = st.columns([1, 1, .72, .75, 1.1, 1.1, 1.1, .78], gap="small", vertical_alignment="center")
+    top = st.columns([1, 1, .72, .75, 1.1, 1.1, 1.1, .78, .82], gap="small", vertical_alignment="center")
     with top[0]:
         kpi("Soma de VALOR_NF", money_short(float(df["VALOR_NF"].sum())), "＄", "")
     with top[1]:
         kpi("Quantidade", count_short(len(df)), "▤", "")
-    with top[2]:
-        emitter_filter = filter_select("LOJAS E PA'S", EMISSOR_FILTER_NAMES, "backlog_emissor")
-    with top[3]:
-        shipper_filter = filter_select("CLIENTES", CLIENT_FILTER_NAMES, "backlog_shipper")
-    with top[4]:
-        request_period = period_picker(df, "SOLICITACAO", "DATA_SOLICITAÇÃO", "backlog_sol", default=(date(2024, 7, 1), date(2026, 9, 3)))
-    with top[5]:
-        event_period = period_picker(df, "DATA_ATUAL", "DATA_EVENTO", "backlog_evento", default=(date(2024, 7, 10), date(2026, 9, 7)))
-    with top[6]:
-        emission_period = period_picker(df, "DT_EMISSAO", "DT_EMISSAO", "backlog_emissao")
-    with top[7]:
-        status_filter = filter_select("STATUS_ATUAL", BACKLOG_STATUS_NAMES, "backlog_status")
-
+    backlog_filter_specs = [
+        {"key": "backlog_emissor", "label": "LOJAS E PA'S", "field": "EMISSOR", "options": EMISSOR_FILTER_NAMES},
+        {"key": "backlog_shipper", "label": "CLIENTES", "field": "SHIPPER", "options": CLIENT_FILTER_NAMES},
+        {"key": "backlog_status", "label": "STATUS_ATUAL", "field": "STATUS_ATUAL", "options": BACKLOG_STATUS_NAMES},
+        {"key": "backlog_vencimento", "label": "VENCIMENTO", "kind": "vencimento"},
+    ]
+    backlog_periods = synchronized_periods(
+        df,
+        [
+            {"key": "backlog_sol", "label": "DATA_SOLICITAÇÃO", "field": "SOLICITACAO", "default": (date(2024, 7, 1), date(2026, 9, 3)), "include_missing_when_full": True},
+            {"key": "backlog_evento", "label": "DATA_EVENTO", "field": "DATA_ATUAL", "default": (date(2024, 7, 10), date(2026, 9, 7)), "include_missing_when_full": True},
+            {"key": "backlog_emissao", "label": "DT_EMISSAO", "field": "DT_EMISSAO", "include_missing_when_full": True},
+        ],
+        backlog_filter_specs,
+        [top[4], top[5], top[6]],
+    )
+    request_period = backlog_periods["backlog_sol"]
+    event_period = backlog_periods["backlog_evento"]
+    emission_period = backlog_periods["backlog_emissao"]
     df = apply_period(df, "SOLICITACAO", request_period, include_missing_when_full=True)
     df = apply_period(df, "DATA_ATUAL", event_period, include_missing_when_full=True)
     df = apply_period(df, "DT_EMISSAO", emission_period, include_missing_when_full=True)
+    synced = synchronized_multiselects(
+        df,
+        backlog_filter_specs,
+        [top[2], top[3], top[7], top[8]],
+    )
+    emitter_filter = synced["backlog_emissor"]
+    shipper_filter = synced["backlog_shipper"]
+    status_filter = synced["backlog_status"]
+    due_filter = synced["backlog_vencimento"]
     df = filtered(df, {"SHIPPER": shipper_filter, "EMISSOR": emitter_filter, "STATUS_ATUAL": status_filter})
+    df = filter_vencimento(df, due_filter)
 
     conflicts = df.loc[backlog_conflict_mask(df), [
         "CTE", "PEDIDO", "SHIPPER", "EMISSOR", "STATUS_ATUAL", "VALOR_NF"
@@ -936,13 +1584,17 @@ def backlog_page() -> None:
     categorized_rows = pd.concat([store_rows, client_rows]).sort_index()
 
     with left:
-        table_panel("LOJAS E PA'S", summary_table(store_rows, "EMISSOR", limit=None, options=EMISSOR_FILTER_NAMES, display_field="LOJAS E PA'S"), height=224, dark_header=True, bar_column="BARRA", numeric_columns=("QTDE",), total_note=number_br(store_rows.shape[0]))
+        store_summary = summary_table(store_rows, "EMISSOR", limit=None, options=EMISSOR_FILTER_NAMES, display_field="LOJAS E PA'S")
+        table_panel("LOJAS E PA'S", store_summary, height=224, dark_header=True, bar_column="BARRA", numeric_columns=("QTDE",), total_note=number_br(store_rows.shape[0]), cell_export_context=(store_rows, "EMISSOR", None))
     with mid:
-        table_panel("CLIENTES", summary_table(client_rows, "SHIPPER", limit=None, options=CLIENT_FILTER_NAMES, display_field="CLIENTES"), height=224, dark_header=True, bar_column="BARRA", numeric_columns=("QTDE",), total_note=number_br(client_rows.shape[0]))
+        client_summary = summary_table(client_rows, "SHIPPER", limit=None, options=CLIENT_FILTER_NAMES, display_field="CLIENTES")
+        table_panel("CLIENTES", client_summary, height=224, dark_header=True, bar_column="BARRA", numeric_columns=("QTDE",), total_note=number_br(client_rows.shape[0]), cell_export_context=(client_rows, "SHIPPER", None))
     with right:
-        table_panel("STATUS", summary_table(categorized_rows, STATUS_DIMENSION, limit=None, options=STATUS_DIMENSION_NAMES), height=224, dark_header=True, numeric_columns=("QTDE",), total_note=number_br(categorized_rows.shape[0]))
+        status_summary = summary_table(categorized_rows, STATUS_DIMENSION, limit=None, options=STATUS_DIMENSION_NAMES)
+        table_panel("STATUS", status_summary, height=224, dark_header=True, numeric_columns=("QTDE",), total_note=number_br(categorized_rows.shape[0]), cell_export_context=(categorized_rows, STATUS_DIMENSION, None))
 
     if not pending_conflicts.empty:
+        pending_conflict_records = df.loc[df.index.isin(pending_conflicts.index)]
         with st.expander(f"Conflitos sem solução · {number_br(len(pending_conflicts))} pedidos"):
             table_panel(
                 "CONFLITOS SEM SOLUÇÃO",
@@ -950,6 +1602,7 @@ def backlog_page() -> None:
                 height=280,
                 key_suffix="pending_conflicts",
                 export_name="conflitos_sem_solucao.xlsx",
+                export_frame=pending_conflict_records,
             )
 
     assigned_indices = categorized_rows.index
@@ -957,11 +1610,14 @@ def backlog_page() -> None:
     with st.expander(f"RUA · {number_br(len(rua_rows))} pedidos"):
         rua_left, rua_mid, rua_right = st.columns([1, 1, .9], gap="small")
         with rua_left:
-            table_panel("LOJAS E PA'S", summary_table(rua_rows, "EMISSOR", limit=None, display_field="LOJAS E PA'S"), height=224, dark_header=True, bar_column="BARRA", numeric_columns=("QTDE",), total_note=number_br(len(rua_rows)), key_suffix="rua")
+            rua_store_summary = summary_table(rua_rows, "EMISSOR", limit=None, display_field="LOJAS E PA'S")
+            table_panel("LOJAS E PA'S", rua_store_summary, height=224, dark_header=True, bar_column="BARRA", numeric_columns=("QTDE",), total_note=number_br(len(rua_rows)), key_suffix="rua", cell_export_context=(rua_rows, "EMISSOR", None))
         with rua_mid:
-            table_panel("CLIENTES", summary_table(rua_rows, "SHIPPER", limit=None, display_field="CLIENTES"), height=224, dark_header=True, bar_column="BARRA", numeric_columns=("QTDE",), total_note=number_br(len(rua_rows)), key_suffix="rua")
+            rua_client_summary = summary_table(rua_rows, "SHIPPER", limit=None, display_field="CLIENTES")
+            table_panel("CLIENTES", rua_client_summary, height=224, dark_header=True, bar_column="BARRA", numeric_columns=("QTDE",), total_note=number_br(len(rua_rows)), key_suffix="rua", cell_export_context=(rua_rows, "SHIPPER", None))
         with rua_right:
-            table_panel("STATUS", summary_table(rua_rows, STATUS_DIMENSION, limit=None, options=STATUS_DIMENSION_NAMES), height=224, dark_header=True, numeric_columns=("QTDE",), total_note=number_br(len(rua_rows)), key_suffix="rua")
+            rua_status_summary = summary_table(rua_rows, STATUS_DIMENSION, limit=None, options=STATUS_DIMENSION_NAMES)
+            table_panel("STATUS", rua_status_summary, height=224, dark_header=True, numeric_columns=("QTDE",), total_note=number_br(len(rua_rows)), key_suffix="rua", cell_export_context=(rua_rows, STATUS_DIMENSION, None))
         rua_columns = [
             column for column in ["CTE", "PEDIDO", "SHIPPER", "EMISSOR", "STATUS_ATUAL", "SOLICITACAO", "VALOR_NF"]
             if column in rua_rows
@@ -973,6 +1629,7 @@ def backlog_page() -> None:
             height=280,
             key_suffix="rua_pedidos",
             export_name="pedidos_rua.xlsx",
+            export_frame=rua_rows,
         )
 
     dates = pd.to_datetime(df["DATA_ATUAL"], errors="coerce")
@@ -1005,14 +1662,14 @@ def backlog_page() -> None:
 
 
 def top_common_controls(df: pd.DataFrame, key: str, *, include_aging: bool = False) -> pd.DataFrame:
-    cols = st.columns([1, 1, .75, .75, 1] if include_aging else [1, 1, 1, .9], gap="small", vertical_alignment="center")
+    cols = st.columns([1, 1, 1, 1] if include_aging else [1, 1, 1, .9], gap="small", vertical_alignment="center")
     selected = df.copy()
     # KPI widgets sit first, with date range slicers occupying the right half.
-    metric_cards(cols[:3] if include_aging else cols[:2], selected, show_open=include_aging)
+    metric_cards(cols[:2], selected)
     if include_aging:
-        with cols[3]:
+        with cols[2]:
             period = period_picker(selected, "DATA_ATUAL", "DATA_EVENTO", f"{key}_data", default=(date(2024, 7, 10), date(2026, 9, 7)))
-        with cols[4]:
+        with cols[3]:
             sol = period_picker(selected, "SOLICITACAO", "DATA SOLICITAÇÃO", f"{key}_sol", default=(date(2024, 7, 1), date(2026, 9, 3)))
     else:
         with cols[2]:
@@ -1029,37 +1686,38 @@ def entrada_page() -> None:
     if analysis_base.empty:
         st.info("Não há pedidos classificados como Cliente ou Lojas e PAs nesta base.")
         return
-    top = st.columns([1, 1, 1, 1.05, 1.05, .9], gap="small", vertical_alignment="center")
-    metric_cards(top[:3], analysis_base)
-    with top[3]:
-        at_period = period_picker(analysis_base, "DATA_ATUAL", "DATA_EVENTO", "entrada_data", default=(date(2024, 7, 10), date(2026, 9, 7)))
-    with top[4]:
-        sol_period = period_picker(analysis_base, "SOLICITACAO", "DATA SOLICITAÇÃO", "entrada_sol", default=(date(2024, 7, 1), date(2026, 9, 3)))
-    aging_values = powerbi_aging_bucket(
-        analysis_base["SOLICITACAO"], as_of=PBIX_ENTRY_AGE_AS_OF
-    )
-    present_aging = set(aging_values.dropna().astype(str))
-    aging_options = [bucket for bucket in PBIX_ENTRY_AGE_BUCKETS if bucket in present_aging]
-    previous_aging = st.session_state.get("entrada_aging", [])
-    if not isinstance(previous_aging, list):
-        previous_aging = [previous_aging] if previous_aging else []
-    st.session_state["entrada_aging"] = [
-        bucket for bucket in previous_aging if bucket in aging_options
+    top = st.columns([1, 1, 1.05, 1.05, .9, .85], gap="small", vertical_alignment="center")
+    metric_cards(top[:2], analysis_base)
+    entry_filter_specs = [
+        {"key": "entrada_aging", "label": "AGING", "field": "AgingEntradaPBIX", "options": PBIX_ENTRY_AGE_BUCKETS},
+        {"key": "entrada_vencimento", "label": "VENCIMENTO", "kind": "vencimento"},
     ]
-    with top[5]:
-        aging_filter = st.multiselect(
-            "AGING",
-            aging_options,
-            key="entrada_aging",
-            placeholder="Todos",
-        )
-    selected = apply_period(analysis_base, "DATA_ATUAL", at_period)
-    selected = apply_period(selected, "SOLICITACAO", sol_period)
-    selected = selected.copy()
-    selected["AgingEntradaPBIX"] = powerbi_aging_bucket(
-        selected["SOLICITACAO"], as_of=PBIX_ENTRY_AGE_AS_OF
+    period_base = analysis_base.copy()
+    period_base["AgingEntradaPBIX"] = powerbi_aging_bucket(
+        period_base["DATA_EVENTO"], as_of=PBIX_ENTRY_AGE_AS_OF
     )
-    selected = filtered(selected, {"AgingEntradaPBIX": aging_filter})
+    entry_periods = synchronized_periods(
+        period_base,
+        [
+            {"key": "entrada_data", "label": "DATA_EVENTO", "field": "DATA_ATUAL", "default": (date(2024, 7, 10), date(2026, 9, 7))},
+            {"key": "entrada_sol", "label": "DATA SOLICITAÇÃO", "field": "SOLICITACAO", "default": (date(2024, 7, 1), date(2026, 9, 3))},
+        ],
+        entry_filter_specs,
+        [top[2], top[3]],
+    )
+    at_period = entry_periods["entrada_data"]
+    sol_period = entry_periods["entrada_sol"]
+    date_base = apply_period(period_base, "DATA_ATUAL", at_period)
+    date_base = apply_period(date_base, "SOLICITACAO", sol_period)
+    synced = synchronized_multiselects(
+        date_base,
+        entry_filter_specs,
+        [top[4], top[5]],
+    )
+    aging_filter = synced["entrada_aging"]
+    due_filter = synced["entrada_vencimento"]
+    selected = filtered(date_base, {"AgingEntradaPBIX": aging_filter})
+    selected = filter_vencimento(selected, due_filter)
 
     a, b = st.columns([1.45, 1.0], gap="small")
     with a:
@@ -1103,6 +1761,7 @@ def entrada_page() -> None:
             client_matrix,
             height=236,
             numeric_columns=client_numeric_columns,
+            cell_export_context=(cli, "SHIPPER", "AgingEntradaPBIX"),
         )
     with b:
         cust = selected[
@@ -1135,6 +1794,7 @@ def entrada_page() -> None:
             custody_matrix,
             height=236,
             numeric_columns=custody_numeric_columns,
+            cell_export_context=(cust, "DESCRICAO_ATUAL", "AgingEntradaPBIX"),
         )
 
     c, d = st.columns([1.45, 1.0], gap="small")
@@ -1171,6 +1831,7 @@ def entrada_page() -> None:
             stores_matrix,
             height=212,
             numeric_columns=stores_numeric_columns,
+            cell_export_context=(stores, "EMISSOR", "AgingEntradaPBIX"),
         )
     with d:
         stuck_records = selected[
@@ -1209,75 +1870,175 @@ def entrada_page() -> None:
             status_stuck,
             height=66,
             numeric_columns=status_numeric_columns,
+            cell_export_context=(stuck_records, None, "AgingEntradaPBIX"),
         )
         table_panel(
             "AGING - ENCERRADO",
             status_closed,
             height=66,
             numeric_columns=status_numeric_columns,
+            cell_export_context=(closed_records, None, "AgingEntradaPBIX"),
         )
     footer_detail(selected if not selected.empty else analysis_base)
 
 
 def control_clients_page() -> None:
-    if CONTROL_CLIENTS.empty:
-        st.info("A base ativa não tem registros classificados como Cliente. Os campos dessa página não estão disponíveis nesta fonte.")
-    top = st.columns([1, 1, 1, 1.1, 1.1, .65], gap="small", vertical_alignment="center")
-    metric_cards(top[:3], CONTROL_CLIENTS)
-    with top[3]:
-        data_period = period_picker(CONTROL_CLIENTS, "DATA_ATUAL", "DATA_EVENTO", "cc_data", default=(date(2024, 7, 10), date(2026, 9, 7)))
-    with top[4]:
-        sol_period = period_picker(CONTROL_CLIENTS, "SOLICITACAO", "DATA SOLICITAÇÃO", "cc_sol", default=(date(2024, 7, 1), date(2026, 9, 3)))
-    with top[5]:
-        finalized = st.multiselect("FINALIZADO?", ["EM ABERTO", "FINALIZADO"], key="cc_final", placeholder="Todos")
-    df = apply_period(CONTROL_CLIENTS, "DATA_ATUAL", data_period)
+    # Client control status and detail rows follow the same backlog source so
+    # their totals stay consistent with the imported base.
+    control_base = CONTROL_CLIENTS.iloc[:0].copy()
+    # Keep this page's filters isolated from Backlog; only the source rows are shared.
+    status_base = BASE.loc[BASE["TIPO"].eq("Cliente")].copy()
+    top = st.columns([.9, .9, 1.35, 1.35, 1.05, 1.05, 1.05], gap="small", vertical_alignment="center")
+    status_base["AgingControle"] = powerbi_aging_bucket(
+        status_base["DATA_EVENTO"], as_of=PBIX_ENTRY_AGE_AS_OF
+    )
+    aging_key = "cc_aging_filter_v3"
+    status_key = "cc_status_v2"
+    shipper_key = "cc_shipper_v2"
+    control_filter_specs = [
+        {"key": aging_key, "label": "AGING", "field": "AgingControle", "options": PBIX_ENTRY_AGE_BUCKETS},
+        {"key": status_key, "label": "STATUS", "field": "STATUS_ATUAL", "include_blank": True},
+        {"key": shipper_key, "label": "CLIENTES", "field": "SHIPPER", "include_blank": True},
+    ]
+    control_periods = synchronized_periods(
+        status_base,
+        [
+            {"key": "cc_data_v2", "label": "DATA_EVENTO", "field": "DATA_ATUAL"},
+            {"key": "cc_sol_v2", "label": "DATA SOLICITAÇÃO", "field": "SOLICITACAO"},
+        ],
+        control_filter_specs,
+        [top[2], top[3]],
+    )
+    data_period = control_periods["cc_data_v2"]
+    sol_period = control_periods["cc_sol_v2"]
+    df = apply_period(control_base, "DATA_ATUAL", data_period)
     df = apply_period(df, "SOLICITACAO", sol_period)
-    df = filtered(df, {"FINALIZADO?": finalized})
+    df["AgingControle"] = powerbi_aging_bucket(
+        df["DATA_EVENTO"], as_of=PBIX_ENTRY_AGE_AS_OF
+    )
+    status_rows = apply_period(
+        status_base, "DATA_ATUAL", data_period, include_missing_when_full=True
+    )
+    status_rows = apply_period(
+        status_rows, "SOLICITACAO", sol_period, include_missing_when_full=True
+    )
 
-    aging_cols = st.columns([1, 1.05, 1.25, 1], gap="small", vertical_alignment="center")
-    with aging_cols[0]:
-        aging = st.selectbox("AgingExpedição", ["Todos", *AGE_BUCKETS], key="cc_aging", label_visibility="visible")
-    with aging_cols[1]:
-        extra_period = period_picker(CONTROL_CLIENTS, "DATA_ATUAL", "AGING EXPEDIÇÃO", "cc_aging_dates", default=(date(2026, 6, 17), date(2026, 9, 8)))
-    with aging_cols[2]:
-        status_filter = st.multiselect("STATUS", STATUS_NAMES, key="cc_status", placeholder="Todos")
-    with aging_cols[3]:
-        shipper_filter = st.multiselect("CLIENTES", SHIPPER_NAMES, key="cc_shipper", placeholder="Todos")
-    if aging != "Todos":
-        df = df[df["AgingExpedição"].eq(aging)]
-    df = apply_period(df, "DATA_ATUAL", extra_period)
-    df = filtered(df, {"STATUS_ATUAL": status_filter, "SHIPPER": shipper_filter})
+    status_rows = status_rows.copy()
+    status_rows["AgingControle"] = powerbi_aging_bucket(
+        status_rows["DATA_EVENTO"], as_of=PBIX_ENTRY_AGE_AS_OF
+    )
+
+    synced = synchronized_multiselects(
+        status_rows,
+        control_filter_specs,
+        [top[4], top[5], top[6]],
+    )
+    aging_filter = synced[aging_key]
+    status_filter = synced[status_key]
+    shipper_filter = synced[shipper_key]
+    selected_dimensions = {"STATUS_ATUAL": status_filter, "SHIPPER": shipper_filter}
+    df = filtered(df, selected_dimensions)
+    status_rows = filtered(status_rows, selected_dimensions)
+    metric_cards(top[:2], status_rows)
+
+    def control_matrix(
+        records: pd.DataFrame, row_field: str, limit: int
+    ) -> tuple[pd.DataFrame, tuple[str, ...]]:
+        matrix = matrix_table(
+            records,
+            row_field,
+            "AgingControle",
+            limit=limit,
+            bucket_labels=PBIX_ENTRY_AGE_BUCKETS,
+        )
+        empty_buckets = [
+            bucket
+            for bucket in PBIX_ENTRY_AGE_BUCKETS
+            if bucket in matrix.columns and not matrix[bucket].astype(int).sum()
+        ]
+        matrix = matrix.drop(columns=empty_buckets)
+        numeric = tuple(
+            [bucket for bucket in PBIX_ENTRY_AGE_BUCKETS if bucket in matrix.columns]
+            + (["Total"] if "Total" in matrix.columns else [])
+        )
+        return matrix, numeric
 
     left, right = st.columns([1.15, 1], gap="small")
     with left:
         wait = df[df["STATUS_TRATATIVA"].eq("AGUARDANDO AGENDAMENTO")]
-        table_panel("AGUARDANDO AGENDAMENTO", matrix_table(wait, "SHIPPER", "AgingExpedição", limit=11), height=206, numeric_columns=tuple(BUCKET_LABELS + ["Total"]))
+        wait_matrix, wait_numeric = control_matrix(wait, "SHIPPER", 11)
+        table_panel("AGUARDANDO AGENDAMENTO", wait_matrix, height=206, numeric_columns=wait_numeric)
         shipped = df[df["STATUS_TRATATIVA"].eq("EXPEDIDO")]
-        table_panel("EXPEDIDO", matrix_table(shipped, "SHIPPER", "AgingExpedição", limit=11), height=198, numeric_columns=tuple(BUCKET_LABELS + ["Total"]))
+        shipped_matrix, shipped_numeric = control_matrix(shipped, "SHIPPER", 11)
+        table_panel("EXPEDIDO", shipped_matrix, height=198, numeric_columns=shipped_numeric)
     with right:
-        status_matrix = matrix_table(df, "STATUS_ATUAL", "AgingExpedição", limit=8)
-        table_panel("STATUS", status_matrix, height=170, numeric_columns=tuple(BUCKET_LABELS + ["Total"]))
+        status_matrix, status_numeric = control_matrix(status_rows, "STATUS_ATUAL", 8)
+        table_panel(
+            "STATUS",
+            status_matrix,
+            height=170,
+            numeric_columns=status_numeric,
+            cell_export_context=(status_rows, "STATUS_ATUAL", "AgingControle"),
+        )
         scheduled = df[df["STATUS_TRATATIVA"].eq("AGENDADO")]
-        table_panel("AGENDADO", matrix_table(scheduled, "SHIPPER", "AgingExpedição", limit=5), height=134, numeric_columns=tuple(BUCKET_LABELS + ["Total"]))
+        scheduled_matrix, scheduled_numeric = control_matrix(scheduled, "SHIPPER", 5)
+        table_panel("AGENDADO", scheduled_matrix, height=134, numeric_columns=scheduled_numeric)
         dimension = "CIDADE_ORIGEM" if df["CIDADE_ORIGEM"].notna().any() else "STATUS_ATUAL"
-        table_panel("CONSOLIDADO", matrix_table(df, dimension, "AgingExpedição", limit=5), height=134, numeric_columns=tuple(BUCKET_LABELS + ["Total"]))
-    footer_detail(df if not df.empty else CONTROL_CLIENTS)
+        consolidated_matrix, consolidated_numeric = control_matrix(df, dimension, 5)
+        table_panel("CONSOLIDADO", consolidated_matrix, height=134, numeric_columns=consolidated_numeric)
+    footer_detail(status_rows)
 
 
 def control_stores_page() -> None:
-    if CONTROL_STORES.empty:
-        st.info("A base ativa não tem registros classificados como Lojas e PAs. Os campos dessa página não estão disponíveis nesta fonte.")
-    top = st.columns([1, 1, 1, 1.1, 1.1, .65], gap="small", vertical_alignment="center")
-    metric_cards(top[:3], CONTROL_STORES)
-    with top[3]:
-        data_period = period_picker(CONTROL_STORES, "DATA_ATUAL", "DATA_EVENTO", "cl_data", default=(date(2024, 7, 10), date(2026, 9, 7)))
-    with top[4]:
-        sol_period = period_picker(CONTROL_STORES, "SOLICITACAO", "DATA SOLICITAÇÃO", "cl_sol", default=(date(2024, 7, 1), date(2026, 9, 3)))
-    with top[5]:
-        finalized = st.multiselect("FINALIZADO?", ["EM ABERTO", "FINALIZADO"], key="cl_final", placeholder="Todos")
-    df = apply_period(CONTROL_STORES, "DATA_ATUAL", data_period)
+    control_base = CONTROL_STORES.iloc[:0].copy()
+    status_base = CONTROL_STORES.copy()
+    status_base["AgingControle"] = powerbi_aging_bucket(
+        status_base["DATA_EVENTO"], as_of=PBIX_ENTRY_AGE_AS_OF
+    )
+    top = st.columns([1, 1, 1.1, 1.1, 1, 1, 1], gap="small", vertical_alignment="center")
+    store_filter_specs = [
+        {"key": "cl_aging", "label": "AGING", "field": "AgingControle", "options": PBIX_ENTRY_AGE_BUCKETS},
+        {"key": "cl_status", "label": "STATUS", "field": "STATUS_ATUAL"},
+        {"key": "cl_emissor", "label": "LOJAS E PA'S", "field": "EMISSOR", "options": EMISSOR_FILTER_NAMES},
+    ]
+    store_periods = synchronized_periods(
+        status_base,
+        [
+            {"key": "cl_data", "label": "DATA_EVENTO", "field": "DATA_ATUAL", "default": (date(2024, 7, 10), date(2026, 9, 7)), "include_missing_when_full": True},
+            {"key": "cl_sol", "label": "DATA SOLICITAÇÃO", "field": "SOLICITACAO", "default": (date(2024, 7, 1), date(2026, 9, 3)), "include_missing_when_full": True},
+        ],
+        store_filter_specs,
+        columns=[top[2], top[3]],
+    )
+    data_period = store_periods["cl_data"]
+    sol_period = store_periods["cl_sol"]
+    df = apply_period(control_base, "DATA_ATUAL", data_period)
     df = apply_period(df, "SOLICITACAO", sol_period)
-    df = filtered(df, {"FINALIZADO?": finalized})
+    df["AgingControle"] = powerbi_aging_bucket(
+        df["DATA_EVENTO"], as_of=PBIX_ENTRY_AGE_AS_OF
+    )
+    date_rows = apply_period(
+        status_base, "DATA_ATUAL", data_period, include_missing_when_full=True
+    )
+    date_rows = apply_period(
+        date_rows, "SOLICITACAO", sol_period, include_missing_when_full=True
+    )
+    synced = synchronized_multiselects(
+        date_rows,
+        store_filter_specs,
+        [top[4], top[5], top[6]],
+    )
+    aging_filter = synced["cl_aging"]
+    status_filter = synced["cl_status"]
+    emitter_filter = synced["cl_emissor"]
+    selected_dimensions = {
+        "AgingControle": aging_filter,
+        "STATUS_ATUAL": status_filter,
+        "EMISSOR": emitter_filter,
+    }
+    detail_rows = date_rows
+    df = filtered(df, selected_dimensions)
+    metric_cards(top[:2], detail_rows)
     a, b = st.columns([1.25, 1.0], gap="small")
     with a:
         waiting = df[df["STATUS_TRATATIVA"].eq("LOJAS -TRANSF")]
@@ -1285,7 +2046,7 @@ def control_stores_page() -> None:
     with b:
         shipped = df[df["STATUS_TRATATIVA"].eq("EXPEDIDO")]
         table_panel("EXPEDIDO", matrix_table(shipped, "EMISSOR", "AgingExpedição", limit=25), height=477, numeric_columns=tuple(BUCKET_LABELS + ["Total"]))
-    footer_detail(df if not df.empty else CONTROL_STORES)
+    footer_detail(detail_rows)
 
 
 def faixa_valor_page() -> None:
@@ -1293,28 +2054,64 @@ def faixa_valor_page() -> None:
     if analysis_base.empty:
         st.info("Não há pedidos classificados como Cliente ou Lojas e PAs nesta base.")
         return
-    top = st.columns([1, 1, 1, 1.1, 1.1, .65], gap="small", vertical_alignment="center")
-    metric_cards(top[:3], analysis_base)
-    with top[3]:
-        date_filter = period_picker(analysis_base, "DATA_ATUAL", "DATA_EVENTO", "fv_data")
-    with top[4]:
-        shipper = st.multiselect("CLIENTES", SHIPPER_NAMES, key="fv_shipper", placeholder="Todos")
-    with top[5]:
-        tipo = st.multiselect("TIPO", category_options("TIPO", analysis_base), key="fv_tipo", placeholder="Todos")
-    df = apply_period(analysis_base.copy(), "DATA_ATUAL", date_filter)
-    df = filtered(df, {"SHIPPER": shipper, "TIPO": tipo})
+    top = st.columns([1, 1, 1.05, .9, .9, .9, .75, .75], gap="small", vertical_alignment="center")
+    metric_cards(top[:2], analysis_base)
+    faixa_filter_specs = [
+        {"key": "fv_faixa_valor", "label": "FAIXA DE VALOR", "field": "Faixa_Valor", "options": list(reversed(VALUE_BANDS)), "placeholder": "Todas"},
+        {"key": "fv_emissor", "label": "LOJAS E PA'S", "field": "EMISSOR", "options": EMISSOR_FILTER_NAMES},
+        {"key": "fv_shipper", "label": "CLIENTES", "field": "SHIPPER", "options": SHIPPER_NAMES},
+        {"key": "fv_tipo", "label": "TIPO", "field": "TIPO", "options": category_options("TIPO", analysis_base)},
+        {"key": "fv_vencimento", "label": "VENCIMENTO", "kind": "vencimento"},
+    ]
+    faixa_periods = synchronized_periods(
+        analysis_base,
+        [{"key": "fv_data", "label": "DATA_EVENTO", "field": "DATA_ATUAL"}],
+        faixa_filter_specs,
+        [top[2]],
+    )
+    date_filter = faixa_periods["fv_data"]
+    date_base = apply_period(analysis_base.copy(), "DATA_ATUAL", date_filter)
+    present_value_bands = set(category_options("Faixa_Valor", date_base))
+    value_band_options = [band for band in reversed(VALUE_BANDS) if band in present_value_bands]
+    faixa_filter_specs[3]["options"] = category_options("TIPO", date_base)
+    synced = synchronized_multiselects(
+        date_base,
+        faixa_filter_specs,
+        [top[3], top[4], top[5], top[6], top[7]],
+    )
+    faixa_filter = synced["fv_faixa_valor"]
+    emissor = synced["fv_emissor"]
+    shipper = synced["fv_shipper"]
+    tipo = synced["fv_tipo"]
+    due_filter = synced["fv_vencimento"]
+    df = date_base
+    df = filtered(df, {"Faixa_Valor": faixa_filter, "EMISSOR": emissor, "SHIPPER": shipper, "TIPO": tipo})
+    df = filter_vencimento(df, due_filter)
     a, b, c = st.columns([1.35, .95, .95], gap="small")
     with a:
-        table_panel("FAIXA DE VALOR", summary_table(df, "Faixa_Valor", limit=8), height=225, dark_header=True, numeric_columns=("QTDE",))
+        value_summary = summary_table(df, "Faixa_Valor", limit=8)
+        value_order = {band: index for index, band in enumerate(value_band_options)}
+        value_rows = value_summary.loc[value_summary["Faixa_Valor"].ne("Total")].copy()
+        value_rows["_sort_order"] = value_rows["Faixa_Valor"].map(value_order)
+        value_rows = value_rows.sort_values("_sort_order").drop(columns="_sort_order")
+        total_row = value_summary.loc[value_summary["Faixa_Valor"].eq("Total")]
+        value_summary = pd.concat([value_rows, total_row], ignore_index=True)
+        table_panel("FAIXA DE VALOR", value_summary, height=225, dark_header=True, numeric_columns=("QTDE",), cell_export_context=(df, "Faixa_Valor", None))
     with b:
-        table_panel("CLIENTES", summary_table(df[df["TIPO"].eq("Cliente")], "SHIPPER", limit=10, display_field="CLIENTES"), height=225, dark_header=True, numeric_columns=("QTDE",))
+        client_records = df[df["TIPO"].eq("Cliente")]
+        client_summary = summary_table(client_records, "SHIPPER", limit=10, display_field="CLIENTES")
+        table_panel("CLIENTES", client_summary, height=225, dark_header=True, numeric_columns=("QTDE",), cell_export_context=(client_records, "SHIPPER", None))
     with c:
-        table_panel("LOJAS E PA'S", summary_table(df[df["TIPO"].eq("Lojas e PAs")], "EMISSOR", limit=10, display_field="LOJAS E PA'S"), height=225, dark_header=True, numeric_columns=("QTDE",))
+        store_records = df[df["TIPO"].eq("Lojas e PAs")]
+        store_summary = summary_table(store_records, "EMISSOR", limit=10, display_field="LOJAS E PA'S")
+        table_panel("LOJAS E PA'S", store_summary, height=225, dark_header=True, numeric_columns=("QTDE",), cell_export_context=(store_records, "EMISSOR", None))
     d, e = st.columns([1.15, 1], gap="small")
     with d:
-        table_panel("STATUS", matrix_table(df, "STATUS_ATUAL", "AgingEntrada", limit=9), height=235, numeric_columns=tuple(BUCKET_LABELS + ["Total"]))
+        status_matrix = matrix_table(df, "STATUS_ATUAL", "AgingEntrada", limit=9)
+        table_panel("STATUS", status_matrix, height=235, numeric_columns=tuple(BUCKET_LABELS + ["Total"]), cell_export_context=(df, "STATUS_ATUAL", "AgingEntrada"))
     with e:
-        table_panel("OCORRÊNCIA", matrix_table(df, "DESCRICAO_ATUAL", "AgingEntrada", limit=9), height=235, numeric_columns=tuple(BUCKET_LABELS + ["Total"]))
+        occurrence_matrix = matrix_table(df, "DESCRICAO_ATUAL", "AgingEntrada", limit=9)
+        table_panel("OCORRÊNCIA", occurrence_matrix, height=235, numeric_columns=tuple(BUCKET_LABELS + ["Total"]), cell_export_context=(df, "DESCRICAO_ATUAL", "AgingEntrada"))
     footer_detail(df if not df.empty else analysis_base)
 
 
@@ -1323,38 +2120,70 @@ def lista_cte_page() -> None:
     with sidebar:
         with st.container(border=True):
             st.markdown('<div class="panel-title" style="font-size:17px;text-align:center">FILTROS</div>', unsafe_allow_html=True)
-            df = CLASSIFIED_BASE.copy()
-            p1 = period_picker(df, "SOLICITACAO", "DATA SOLICITAÇÃO", "lista_sol")
-            p2 = period_picker(df, "DT_EMISSAO", "DATA EMISSÃO", "lista_emissao")
-            for field, label, choices in [
-                ("SHIPPER", "CLIENTES", SHIPPER_NAMES), ("EMISSOR", "LOJAS E PA'S", EMITTER_NAMES),
-                ("STATUS_TRATATIVA", "STATUS_TT", category_options("STATUS_TRATATIVA", CLASSIFIED_BASE)),
-                ("TIPO", "TIPO", category_options("TIPO", CLASSIFIED_BASE)),
-                ("MANIFESTO", "MANIFESTO", ["(Em branco)", *sorted(CLASSIFIED_BASE["MANIFESTO"].dropna().astype(str).unique())[:30]]),
-                ("PROXIMA_UNIDADE", "PROXIMA_UNIDADE", UNIT_NAMES), ("Faixa_Valor", "Faixa_Valor", VALUE_BANDS),
+            # Lista CTE exibe a base integral; TIPO permite alternar entre as
+            # três classificações exclusivas, incluindo os pedidos em Rua.
+            df = BASE.copy()
+            lista_filter_specs = [
+                {"key": "lista_vencimento", "label": "VENCIMENTO", "kind": "vencimento"},
+                {"key": "lista_SHIPPER", "label": "CLIENTES", "field": "SHIPPER", "options": category_options("SHIPPER", BASE)},
+                {"key": "lista_EMISSOR", "label": "LOJAS E PA'S", "field": "EMISSOR", "options": category_options("EMISSOR", BASE)},
+                {"key": "lista_STATUS_ATUAL", "label": "STATUS ATUAL", "field": "STATUS_ATUAL", "options": category_options("STATUS_ATUAL", BASE)},
+                {"key": "lista_TIPO", "label": "TIPO", "field": "TIPO", "options": ["Cliente", "Lojas e PAs", "Rua"]},
+                {"key": "lista_MANIFESTO", "label": "MANIFESTO", "field": "MANIFESTO", "options": ["(Em branco)", *sorted(BASE["MANIFESTO"].dropna().astype(str).unique())[:30]], "include_blank": True, "placeholder": "Pesquisar"},
+                {"key": "lista_PROXIMA_UNIDADE", "label": "PROXIMA_UNIDADE", "field": "PROXIMA_UNIDADE", "options": category_options("PROXIMA_UNIDADE", BASE)},
+                {"key": "lista_Faixa_Valor", "label": "Faixa_Valor", "field": "Faixa_Valor", "options": VALUE_BANDS},
+            ]
+            lista_periods = synchronized_periods(
+                df,
+                [
+                    {"key": "lista_sol", "label": "DATA SOLICITAÇÃO", "field": "SOLICITACAO", "include_missing_when_full": True},
+                    {"key": "lista_emissao", "label": "DATA EMISSÃO", "field": "DT_EMISSAO", "include_missing_when_full": True},
+                ],
+                lista_filter_specs,
+            )
+            df = apply_period(df, "SOLICITACAO", lista_periods["lista_sol"], include_missing_when_full=True)
+            df = apply_period(df, "DT_EMISSAO", lista_periods["lista_emissao"], include_missing_when_full=True)
+            synced = synchronized_multiselects(
+                df,
+                lista_filter_specs,
+            )
+            for filter_spec in [
+                {"key": "lista_SHIPPER", "field": "SHIPPER"},
+                {"key": "lista_EMISSOR", "field": "EMISSOR"},
+                {"key": "lista_STATUS_ATUAL", "field": "STATUS_ATUAL"},
+                {"key": "lista_TIPO", "field": "TIPO"},
+                {"key": "lista_MANIFESTO", "field": "MANIFESTO", "include_blank": True},
+                {"key": "lista_PROXIMA_UNIDADE", "field": "PROXIMA_UNIDADE"},
+                {"key": "lista_Faixa_Valor", "field": "Faixa_Valor"},
             ]:
-                selected = st.multiselect(label, choices, key=f"lista_{field}", placeholder="Pesquisar")
-                if selected:
-                    if field == "MANIFESTO" and "(Em branco)" in selected:
-                        df = df[df[field].isna() | df[field].astype(str).isin(selected)]
-                    else:
-                        df = df[df[field].astype(str).isin(selected)]
+                df = _apply_filter_spec(df, filter_spec, synced[filter_spec["key"]])
+            df = filter_vencimento(df, synced["lista_vencimento"])
             search = st.text_input("PESQUISAR CTE / PEDIDO", key="lista_busca", placeholder="Pesquisar")
             if search.strip():
                 mask = df["CTE"].astype(str).str.contains(search, case=False) | df["PEDIDO"].astype(str).str.contains(search, case=False)
                 df = df[mask]
-            if isinstance(p1, tuple) and len(p1) == 2:
-                df = apply_period(df, "SOLICITACAO", p1)
-            if isinstance(p2, tuple) and len(p2) == 2:
-                df = apply_period(df, "DT_EMISSAO", p2)
     with main:
         with st.container(border=True):
             st.markdown(f'<div class="panel-title">RESULTADO DA CONSULTA · {number_br(len(df))} REGISTROS</div>', unsafe_allow_html=True)
-            view = df.loc[:, ["CTE", "PEDIDO", "STATUS_ATUAL", "SOLICITACAO", "DESCRICAO_ATUAL", "STATUS_TRATATIVA", "EMISSOR", "SOLICITANTE", "PROXIMA_UNIDADE", "SHIPPER", "MANIFESTO", "VALOR_NF"]].copy()
-            view = view.rename(columns={"SHIPPER": "CLIENTES", "EMISSOR": "LOJAS E PA'S"})
-            view["SOLICITACAO"] = pd.to_datetime(view["SOLICITACAO"]).dt.strftime("%d/%m/%Y")
-            view["VALOR_NF"] = view["VALOR_NF"].map(lambda val: "—" if pd.isna(val) else f"R$ {decimal_br(val)}")
-            st.dataframe(view, use_container_width=True, hide_index=True, height=535)
+            view = detail_export_frame(df)
+            detail_column_config: dict[str, object] = {
+                "CTE": st.column_config.TextColumn("CTE", width="medium"),
+                "PEDIDO": st.column_config.TextColumn("PEDIDO", width="medium"),
+                "TIPO": st.column_config.TextColumn("TIPO", width="medium"),
+                "AGING": st.column_config.TextColumn("AGING", width="small"),
+            }
+            for column in view.columns:
+                if pd.api.types.is_datetime64_any_dtype(view[column]):
+                    detail_column_config[column] = st.column_config.DateColumn(
+                        column, format="DD/MM/YYYY", width="small"
+                    )
+            st.dataframe(
+                view,
+                use_container_width=True,
+                hide_index=True,
+                height=535,
+                column_config=detail_column_config,
+            )
 with st.sidebar:
     st.markdown("### Páginas")
     selected_page = st.radio("Navegação do relatório", PAGES, index=0, label_visibility="collapsed", key="report_page")
