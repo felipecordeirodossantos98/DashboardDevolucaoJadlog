@@ -261,7 +261,6 @@ with st.sidebar:
     uploaded_file = st.file_uploader(
         "Arquivo Excel (.xlsx ou .xlsm)",
         type=["xlsx", "xlsm"],
-        help="Importe uma base Excel para abrir o painel. O arquivo fica ativo nesta sessão.",
         key="dashboard_source_upload_v2",
     )
 
@@ -1188,6 +1187,48 @@ def _apply_filter_spec(frame: pd.DataFrame, spec: dict, selected: list[str]) -> 
     return filtered(frame, {spec["field"]: selected})
 
 
+def _apply_filter_specs(
+    frame: pd.DataFrame,
+    specs: list[dict],
+    selections: dict[str, list[str]],
+    *,
+    exclude_group: str | None = None,
+    exclude_key: str | None = None,
+) -> pd.DataFrame:
+    """Apply ordinary facets and combine customer/store facets within TIPO."""
+    out = frame
+    handled_groups: set[str] = set()
+    for spec in specs:
+        if spec["key"] == exclude_key:
+            continue
+        group = spec.get("selection_group")
+        if group:
+            if group == exclude_group or group in handled_groups:
+                continue
+            handled_groups.add(group)
+            members = [item for item in specs if item.get("selection_group") == group]
+            active = [item for item in members if selections.get(item["key"])]
+            if active and "TIPO" in out.columns:
+                mask = pd.Series(False, index=out.index)
+                for item in active:
+                    category_mask = out["TIPO"].eq(item["classification_type"])
+                    values = out[item["field"]].astype("string")
+                    selected = selections[item["key"]]
+                    item_mask = values.isin([value for value in selected if value != "(Em branco)"])
+                    if "(Em branco)" in selected:
+                        item_mask |= values.isna() | values.fillna("").str.strip().eq("")
+                    mask |= category_mask & item_mask
+                out = out.loc[mask]
+            elif active:
+                # Frames without classification metadata retain the usual
+                # field-by-field behavior.
+                for item in active:
+                    out = _apply_filter_spec(out, item, selections[item["key"]])
+            continue
+        out = _apply_filter_spec(out, spec, selections.get(spec["key"], []))
+    return out
+
+
 def synchronized_multiselects(
     frame: pd.DataFrame,
     specs: list[dict],
@@ -1200,10 +1241,13 @@ def synchronized_multiselects(
         _consume_multiselect_clear(key)
         selections[key] = _selection_values(st.session_state.get(key, []))
     for index, spec in enumerate(specs):
-        candidates = frame
-        for other in specs:
-            if other["key"] != spec["key"]:
-                candidates = _apply_filter_spec(candidates, other, selections[other["key"]])
+        candidates = _apply_filter_specs(
+            frame,
+            specs,
+            selections,
+            exclude_group=spec.get("selection_group"),
+            exclude_key=spec["key"] if not spec.get("selection_group") else None,
+        )
 
         if spec.get("kind") == "vencimento":
             options = [
@@ -1301,10 +1345,7 @@ def synchronized_periods(
                     candidates, other["field"], periods[other["key"]],
                     include_missing_when_full=other.get("include_missing_when_full", False),
                 )
-        for filter_spec in filter_specs:
-            candidates = _apply_filter_spec(
-                candidates, filter_spec, selections[filter_spec["key"]]
-            )
+        candidates = _apply_filter_specs(candidates, filter_specs, selections)
 
         values = pd.to_datetime(candidates[spec["field"]], errors="coerce").dropna()
         if values.empty:
@@ -1532,8 +1573,8 @@ def backlog_page() -> None:
     with top[1]:
         kpi("Quantidade", count_short(len(df)), "▤", "")
     backlog_filter_specs = [
-        {"key": "backlog_emissor", "label": "LOJAS E PA'S", "field": "EMISSOR", "options": EMISSOR_FILTER_NAMES},
-        {"key": "backlog_shipper", "label": "CLIENTES", "field": "SHIPPER", "options": CLIENT_FILTER_NAMES},
+        {"key": "backlog_emissor", "label": "LOJAS E PA'S", "field": "EMISSOR", "options": EMISSOR_FILTER_NAMES, "selection_group": "party_type", "classification_type": "Lojas e PAs"},
+        {"key": "backlog_shipper", "label": "CLIENTES", "field": "SHIPPER", "options": CLIENT_FILTER_NAMES, "selection_group": "party_type", "classification_type": "Cliente"},
         {"key": "backlog_status", "label": "STATUS_ATUAL", "field": "STATUS_ATUAL", "options": BACKLOG_STATUS_NAMES},
         {"key": "backlog_vencimento", "label": "VENCIMENTO", "kind": "vencimento"},
     ]
@@ -1558,12 +1599,7 @@ def backlog_page() -> None:
         backlog_filter_specs,
         [top[2], top[3], top[7], top[8]],
     )
-    emitter_filter = synced["backlog_emissor"]
-    shipper_filter = synced["backlog_shipper"]
-    status_filter = synced["backlog_status"]
-    due_filter = synced["backlog_vencimento"]
-    df = filtered(df, {"SHIPPER": shipper_filter, "EMISSOR": emitter_filter, "STATUS_ATUAL": status_filter})
-    df = filter_vencimento(df, due_filter)
+    df = _apply_filter_specs(df, backlog_filter_specs, synced)
 
     conflicts = df.loc[backlog_conflict_mask(df), [
         "CTE", "PEDIDO", "SHIPPER", "EMISSOR", "STATUS_ATUAL", "VALOR_NF"
@@ -2066,8 +2102,8 @@ def faixa_valor_page() -> None:
     metric_cards(top[:2], analysis_base)
     faixa_filter_specs = [
         {"key": "fv_faixa_valor", "label": "FAIXA DE VALOR", "field": "Faixa_Valor", "options": list(reversed(VALUE_BANDS)), "placeholder": "Todas"},
-        {"key": "fv_emissor", "label": "LOJAS E PA'S", "field": "EMISSOR", "options": EMISSOR_FILTER_NAMES},
-        {"key": "fv_shipper", "label": "CLIENTES", "field": "SHIPPER", "options": SHIPPER_NAMES},
+        {"key": "fv_emissor", "label": "LOJAS E PA'S", "field": "EMISSOR", "options": EMISSOR_FILTER_NAMES, "selection_group": "party_type", "classification_type": "Lojas e PAs"},
+        {"key": "fv_shipper", "label": "CLIENTES", "field": "SHIPPER", "options": SHIPPER_NAMES, "selection_group": "party_type", "classification_type": "Cliente"},
         {"key": "fv_tipo", "label": "TIPO", "field": "TIPO", "options": category_options("TIPO", analysis_base)},
         {"key": "fv_vencimento", "label": "VENCIMENTO", "kind": "vencimento"},
     ]
@@ -2087,14 +2123,8 @@ def faixa_valor_page() -> None:
         faixa_filter_specs,
         [top[3], top[4], top[5], top[6], top[7]],
     )
-    faixa_filter = synced["fv_faixa_valor"]
-    emissor = synced["fv_emissor"]
-    shipper = synced["fv_shipper"]
-    tipo = synced["fv_tipo"]
-    due_filter = synced["fv_vencimento"]
     df = date_base
-    df = filtered(df, {"Faixa_Valor": faixa_filter, "EMISSOR": emissor, "SHIPPER": shipper, "TIPO": tipo})
-    df = filter_vencimento(df, due_filter)
+    df = _apply_filter_specs(df, faixa_filter_specs, synced)
     a, b, c = st.columns([1.35, .95, .95], gap="small")
     with a:
         value_summary = summary_table(df, "Faixa_Valor", limit=8)
@@ -2133,8 +2163,8 @@ def lista_cte_page() -> None:
             df = BASE.copy()
             lista_filter_specs = [
                 {"key": "lista_vencimento", "label": "VENCIMENTO", "kind": "vencimento"},
-                {"key": "lista_SHIPPER", "label": "CLIENTES", "field": "SHIPPER", "options": category_options("SHIPPER", BASE)},
-                {"key": "lista_EMISSOR", "label": "LOJAS E PA'S", "field": "EMISSOR", "options": category_options("EMISSOR", BASE)},
+                {"key": "lista_SHIPPER", "label": "CLIENTES", "field": "SHIPPER", "options": category_options("SHIPPER", BASE), "selection_group": "party_type", "classification_type": "Cliente"},
+                {"key": "lista_EMISSOR", "label": "LOJAS E PA'S", "field": "EMISSOR", "options": category_options("EMISSOR", BASE), "selection_group": "party_type", "classification_type": "Lojas e PAs"},
                 {"key": "lista_STATUS_ATUAL", "label": "STATUS ATUAL", "field": "STATUS_ATUAL", "options": category_options("STATUS_ATUAL", BASE)},
                 {"key": "lista_TIPO", "label": "TIPO", "field": "TIPO", "options": ["Cliente", "Lojas e PAs", "Rua"]},
                 {"key": "lista_MANIFESTO", "label": "MANIFESTO", "field": "MANIFESTO", "options": ["(Em branco)", *sorted(BASE["MANIFESTO"].dropna().astype(str).unique())[:30]], "include_blank": True, "placeholder": "Pesquisar"},
@@ -2155,17 +2185,7 @@ def lista_cte_page() -> None:
                 df,
                 lista_filter_specs,
             )
-            for filter_spec in [
-                {"key": "lista_SHIPPER", "field": "SHIPPER"},
-                {"key": "lista_EMISSOR", "field": "EMISSOR"},
-                {"key": "lista_STATUS_ATUAL", "field": "STATUS_ATUAL"},
-                {"key": "lista_TIPO", "field": "TIPO"},
-                {"key": "lista_MANIFESTO", "field": "MANIFESTO", "include_blank": True},
-                {"key": "lista_PROXIMA_UNIDADE", "field": "PROXIMA_UNIDADE"},
-                {"key": "lista_Faixa_Valor", "field": "Faixa_Valor"},
-            ]:
-                df = _apply_filter_spec(df, filter_spec, synced[filter_spec["key"]])
-            df = filter_vencimento(df, synced["lista_vencimento"])
+            df = _apply_filter_specs(df, lista_filter_specs, synced)
             search = st.text_input("PESQUISAR CTE / PEDIDO", key="lista_busca", placeholder="Pesquisar")
             if search.strip():
                 mask = df["CTE"].astype(str).str.contains(search, case=False) | df["PEDIDO"].astype(str).str.contains(search, case=False)
